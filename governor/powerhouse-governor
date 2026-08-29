@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""powerhouse-governor — the single control board for the HP Victus.
+
+Runs as root from every boot (systemd). Responsibilities:
+  * EC arbiter: the ONLY process that touches the ITE EC through Super I/O
+    ports 0x2E/0x2F. One thread, one lock, register whitelist, rate limit.
+    The keyboard backlight soft-PWM lives here (clients just send a duty).
+  * Governor loop: samples GPU/CPU/thermal state every TICK seconds and
+    enforces /etc/powerhouse/limits.json. Anything above a cap is reverted
+    within one tick and logged as an incident.
+  * Crash memory: writes /var/lib/powerhouse/last-state.json every tick and a
+    clean-shutdown marker on stop. If the marker is missing at boot the
+    previous boot was a hard crash: the last state is recorded to
+    incidents.jsonl, caps are tightened below whatever was active, and an AI
+    review (Opus 5) is requested.
+  * Applies /etc/powerhouse/desired.json (written only by powerhouse-apply,
+    which runs behind a polkit password prompt), clamped to the limits.
+
+Socket: /run/powerhouse/sock — newline-delimited JSON, one request per line.
+"""
+import json, os, signal, socket, subprocess, sys, threading, time, glob, pwd, grp, fcntl
+
+VERSION = "1.0.0"
+PREFIX = os.environ.get("POWERHOUSE_PREFIX", "")        # test/dry-run: relocate all state, no hardware
+DRY = bool(PREFIX) or os.environ.get("POWERHOUSE_DRY") == "1"
+ETC = PREFIX + "/etc/powerhouse"
+VAR = PREFIX + "/var/lib/powerhouse"
+RUN = PREFIX + "/run/powerhouse"
+SOCK = f"{RUN}/sock"
+LIMITS_F = f"{ETC}/limits.json"
+DESIRED_F = f"{ETC}/desired.json"
+CONF_F = f"{ETC}/governor.json"
+STATE_F = f"{VAR}/last-state.json"
+MARKER_F = f"{VAR}/clean-shutdown"
+INCIDENTS_F = f"{VAR}/incidents.jsonl"
+EVENTS_F = f"{VAR}/events.jsonl"
+FLAG_F = f"{VAR}/ai-review"          # contains "opus" or "sonnet" when a review is wanted
+NVML = "/usr/local/bin/victus-gpu-nvml"
+TICK = 3.0
+
+STOCK = {"gpc": 0, "mem": 0, "pl1": 45, "pl2": 115}
+DEFAULT_LIMITS = {
+    "gpc_max": 100, "mem_max": 300, "gpc_min": -300, "mem_min": -500,
+    "pl1_max": 45, "pl2_max": 115,
+    "gpu_temp_max": 87, "cpu_temp_max": 95,
+    "kbd_pwm_hz": 125, "kbd_writes_per_s_max": 400, "kbd_audio_allowed": True,
+    "tighten_step": 50, "source": "default",
+    # thermal guard: react to spikes, not just steady heat
+    "cpu_hot": 88, "cpu_crit": 94, "gpu_hot": 83, "spike_c": 15, "spike_floor": 85, "cool_c": 75, "cool_hold_s": 60,
+    "hot_pl": [35, 55], "crit_pl": [20, 35],
+}
+FAN_SOCK = "/run/victus-control/victus_backend.sock"
+DEFAULT_CONF = {"user": "", "tick": TICK}
+
+# ----------------------------------------------------------------- utilities
+def now(): return time.time()
+def log(msg, **kv):
+    rec = {"t": round(now(), 3), "msg": msg, **kv}
+    print(json.dumps(rec), flush=True)
+    try:
+        with open(EVENTS_F, "a") as f: f.write(json.dumps(rec) + "\n")
+    except OSError: pass
+
+def jload(p, default):
+    try:
+        with open(p) as f: return json.load(f)
+    except (OSError, ValueError): return default
+
+def jsave(p, obj):
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f: json.dump(obj, f, indent=1); f.write("\n")
+    os.replace(tmp, p)
+
+def readf(p, default=None):
+    try:
+        with open(p) as f: return f.read().strip()
+    except OSError: return default
+
+def sh(cmd, timeout=8):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except Exception as e:
+        return 99, "", str(e)
+
+# ----------------------------------------------------------------- EC arbiter
+class EC:
+    """Sole owner of Super I/O 0x2E/0x2F. Same byte sequence as the original
+    kbdlight-helper.c, but serialized behind one lock and whitelisted."""
+    KB = 0x1805
+    ALLOWED = {0x1805}
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.port = None if DRY else os.open("/dev/port", os.O_RDWR)
+        self.sim = {}                                    # dry-run register file
+        self.writes = 0          # total EC RAM writes
+        self.window = []         # timestamps for rate limiting
+        self.disabled = False    # tripped if rate limit exceeded
+        self.last_err = ""
+
+    def _outb(self, port, val):
+        if self.port is None: self.sim[port] = val & 0xFF; return
+        os.pwrite(self.port, bytes([val & 0xFF]), port)
+    def _inb(self, port):
+        if self.port is None: return self.sim.get(0x2F, 0)
+        return os.pread(self.port, 1, port)[0]
+    def _sw(self, i, v): self._outb(0x2E, i); self._outb(0x2F, v)
+    def _sr(self, i):     self._outb(0x2E, i); return self._inb(0x2F)
+    def _addr(self, reg):
+        self._sw(0x2E, 0x11); self._sw(0x2F, (reg >> 8) & 0xFF)
+        self._sw(0x2E, 0x10); self._sw(0x2F, reg & 0xFF)
+
+    def _ratelimit(self, limit):
+        t = now(); self.window = [x for x in self.window if t - x < 1.0]
+        if len(self.window) >= limit:
+            self.disabled = True; self.last_err = f"EC write rate > {limit}/s — arbiter tripped"
+            log("ec.tripped", rate=len(self.window), limit=limit)
+            return False
+        self.window.append(t); return True
+
+    def write(self, reg, val, limit=400):
+        if reg not in self.ALLOWED: raise PermissionError(f"EC reg {reg:#06x} not whitelisted")
+        if self.disabled: return False
+        with self.lock:
+            if not self._ratelimit(limit): return False
+            self._addr(reg); self._sw(0x2E, 0x12); self._sw(0x2F, val & 0xFF)
+            self.writes += 1
+        return True
+
+    def read(self, reg):
+        if reg not in self.ALLOWED: raise PermissionError(f"EC reg {reg:#06x} not whitelisted")
+        with self.lock:
+            self._addr(reg); self._sw(0x2E, 0x12); return self._sr(0x2F)
+
+class Keyboard(threading.Thread):
+    """Keyboard backlight driver on top of the EC arbiter. duty 0/100 = steady
+    (80 ms same-value refresh because this EC restores ON ~1 s after OFF);
+    1..99 = soft-PWM at limits.kbd_pwm_hz. Only one instance ever exists."""
+    ON, OFF = 0xC8, 0x00
+    def __init__(self, ec, gov):
+        super().__init__(daemon=True, name="kbd")
+        self.ec, self.gov = ec, gov
+        self.duty = 0; self.enabled = True; self.want = -1; self.last_refresh = 0.0
+        self.last_client = 0.0; self.pwm_cycles = 0
+    def set(self, duty, who="?"):
+        self.duty = max(0, min(100, int(duty))); self.last_client = now()
+    def run(self):
+        while True:
+            lim = self.gov.limits
+            hz = max(20, min(250, int(lim.get("kbd_pwm_hz", 125)))); period = 1.0 / hz
+            wmax = int(lim.get("kbd_writes_per_s_max", 400))
+            d = self.duty
+            if not self.enabled or self.ec.disabled:
+                time.sleep(0.2); continue
+            if d <= 0 or d >= 100:
+                target = self.ON if d >= 100 else self.OFF
+                t = now()
+                if target != self.want or t - self.last_refresh > 0.08:
+                    self.ec.write(EC.KB, target, wmax); self.want = target; self.last_refresh = t
+                time.sleep(0.015)
+            else:
+                if not lim.get("kbd_audio_allowed", True):
+                    # dimming/PWM forbidden by limits: hold steady ON instead
+                    self.duty = 100; continue
+                on = period * d / 100.0; off = period - on
+                if on > 0: self.ec.write(EC.KB, self.ON, wmax); time.sleep(on)
+                if off > 0: self.ec.write(EC.KB, self.OFF, wmax); time.sleep(off)
+                self.want = -1; self.pwm_cycles += 1
+
+# ----------------------------------------------------------------- governor
+class Governor:
+    def __init__(self):
+        self.conf = {**DEFAULT_CONF, **jload(CONF_F, {})}
+        self.limits = {**DEFAULT_LIMITS, **jload(LIMITS_F, {})}
+        self.desired = jload(DESIRED_F, {})
+        self.desired_mtime = 0.0
+        self.sample = {}
+        self.enforcements = 0
+        self.started = now()
+        self.incident = None
+        self.lock = threading.Lock()
+        self.stopping = False
+        self.ec = None; self.kbd = None
+        self.sim_state = jload(os.environ.get("POWERHOUSE_SIM", ""), {"gpc": 0, "mem": 0, "pl1": 45, "pl2": 115, "temp": 40, "gtemp": 40})
+
+    # ---- crash memory
+    def boot_check(self):
+        last = jload(STATE_F, None)
+        crashed = last is not None and not os.path.exists(MARKER_F)
+        try: os.remove(MARKER_F)
+        except OSError: pass
+        if not crashed:
+            log("boot.clean" if last else "boot.first"); return
+        inc = {"t": now(), "kind": "hard_crash", "last_state": last,
+               "boot_id": readf("/proc/sys/kernel/random/boot_id"),
+               "limits_before": dict(self.limits)}
+        # tighten below whatever was active
+        act = (last or {}).get("active", {})
+        step = int(self.limits.get("tighten_step", 50)); changed = {}
+        locked = dict(self.limits.get("crash_locked") or {})
+        for k, lk in (("gpc", "gpc_max"), ("mem", "mem_max")):
+            v = int(act.get(k, 0) or 0)
+            if v > 0:
+                locked[k] = min(v, int(locked.get(k, v)))          # lowest value ever seen at a crash
+                if self.limits[lk] >= v: self.limits[lk] = max(0, v - step); changed[lk] = self.limits[lk]
+        if locked: self.limits["crash_locked"] = locked; changed["crash_locked"] = locked
+        for k, lk in (("pl1", "pl1_max"), ("pl2", "pl2_max")):
+            v = int(act.get(k, 0) or 0)
+            if v > STOCK[k] and self.limits[lk] >= v:
+                self.limits[lk] = STOCK[k]; changed[lk] = STOCK[k]
+        if act.get("kbd_pwm_active"):
+            hz = int(self.limits.get("kbd_pwm_hz", 125))
+            if hz > 60: self.limits["kbd_pwm_hz"] = max(60, hz // 2); changed["kbd_pwm_hz"] = self.limits["kbd_pwm_hz"]
+            self.limits["kbd_writes_per_s_max"] = min(int(self.limits.get("kbd_writes_per_s_max", 400)), 250)
+        self.limits["source"] = f"tightened after crash {time.strftime('%Y-%m-%d %H:%M')}"
+        inc["limits_after"] = dict(self.limits); inc["changed"] = changed
+        jsave(LIMITS_F, self.limits)
+        with open(INCIDENTS_F, "a") as f: f.write(json.dumps(inc) + "\n")
+        with open(FLAG_F, "w") as f: f.write("opus\n")
+        self.incident = inc
+        # crash = revert everything to stock, regardless of desired.json
+        self.desired = {}; jsave(DESIRED_F, {})
+        log("boot.crash_detected", changed=changed, active=act)
+
+    # ---- sampling
+    def gpu_sample(self):
+        if DRY and os.environ.get("POWERHOUSE_SIM"): self.sim_state.update(jload(os.environ["POWERHOUSE_SIM"], {}))
+        if DRY: return {"pstate": "P0", "clockGr": 2000, "clockMem": 8000, "temp": self.sim_state.get("gtemp", 40), "util": 50, "powerW": 30.0,
+                        "gpc": self.sim_state["gpc"], "mem": self.sim_state["mem"], "enforcedPowerW": 60}
+        s = {}
+        rc, out, _ = sh(["nvidia-smi", "--query-gpu=pstate,clocks.gr,clocks.mem,temperature.gpu,utilization.gpu,power.draw",
+                         "--format=csv,noheader,nounits"], 6)
+        if rc == 0 and out:
+            p = [x.strip() for x in out.split(",")]
+            try: s.update(pstate=p[0], clockGr=int(p[1]), clockMem=int(p[2]), temp=int(p[3]), util=int(p[4]), powerW=float(p[5]))
+            except (ValueError, IndexError): pass
+        if os.path.exists(NVML):
+            rc, out, _ = sh([NVML], 6)
+            try:
+                j = json.loads(out); s.update(gpc=int(j.get("gpcOffset", 0)), mem=int(j.get("memOffset", 0)),
+                                             enforcedPowerW=j.get("enforcedPowerW"), powermizer=j.get("powermizer"))
+            except (ValueError, TypeError): pass
+        return s
+    def cpu_sample(self):
+        if DRY: return {"pl1": self.sim_state["pl1"], "pl2": self.sim_state["pl2"], "temp": self.sim_state.get("temp", 40), "profile": self.sim_state.get("profile", "balanced"), "epp": "balance_performance"}
+        s = {}
+        base = "/sys/class/powercap/intel-rapl:0"
+        for i, k in ((0, "pl1"), (1, "pl2")):
+            v = readf(f"{base}/constraint_{i}_power_limit_uw")
+            if v: s[k] = int(int(v) / 1e6)
+        for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+            if readf(f"{z}/type") == "x86_pkg_temp":
+                v = readf(f"{z}/temp"); s["temp"] = int(int(v) / 1000) if v else None
+        s["profile"] = readf("/sys/firmware/acpi/platform_profile")
+        s["epp"] = readf("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")
+        return s
+
+    # ---- enforcement
+    def set_offsets(self, gpc, mem, why):
+        if DRY: self.sim_state.update(gpc=gpc, mem=mem); log("apply.offset", gpc=gpc, mem=mem, why=why, dry=True); return True
+        rc, out, err = sh([NVML, "offset", str(gpc), str(mem)], 8)
+        log("apply.offset", gpc=gpc, mem=mem, why=why, rc=rc, out=out[:120], err=err[:120]); return rc == 0
+    def set_pl(self, pl1, pl2, why):
+        if DRY: self.sim_state.update(pl1=pl1, pl2=pl2); log("apply.pl", pl1=pl1, pl2=pl2, why=why, dry=True); return True
+        ok = True
+        for base in ("/sys/class/powercap/intel-rapl:0", "/sys/class/powercap/intel-rapl-mmio:0"):   # package domains only (":0:0" sub-zones are read-only)
+            if not os.path.isdir(base): continue
+            for i, w in ((0, pl1), (1, pl2)):
+                try:
+                    with open(f"{base}/constraint_{i}_power_limit_uw", "w") as f: f.write(str(int(w) * 1000000))
+                except OSError as e: ok = False; log("apply.pl.error", path=base, err=str(e))
+        log("apply.pl", pl1=pl1, pl2=pl2, why=why, ok=ok); return ok
+    def set_profile(self, p, why):
+        if DRY: self.sim_state["profile"] = p; return True
+        choices = (readf("/sys/firmware/acpi/platform_profile_choices") or "").split()
+        if p not in choices: return False
+        try:
+            with open("/sys/firmware/acpi/platform_profile", "w") as f: f.write(p)
+            log("apply.profile", profile=p, why=why); return True
+        except OSError as e: log("apply.profile.error", err=str(e)); return False
+
+    def clamp(self, d):
+        L = self.limits; c = {}
+        if "gpc" in d: c["gpc"] = max(int(L["gpc_min"]), min(int(L["gpc_max"]), int(d["gpc"])))
+        if "mem" in d: c["mem"] = max(int(L["mem_min"]), min(int(L["mem_max"]), int(d["mem"])))
+        if "pl1" in d: c["pl1"] = max(10, min(int(L["pl1_max"]), int(d["pl1"])))
+        if "pl2" in d: c["pl2"] = max(10, min(int(L["pl2_max"]), int(d["pl2"])))
+        if "profile" in d: c["profile"] = str(d["profile"])
+        return c
+
+    def apply_desired(self, force=False):
+        try: m = os.stat(DESIRED_F).st_mtime
+        except OSError: m = 0
+        if m == self.desired_mtime and not force: return
+        self.desired_mtime = m
+        d = self.clamp(jload(DESIRED_F, {}))
+        g = self.sample.get("gpu", {}); c = self.sample.get("cpu", {})
+        gpc, mem = d.get("gpc", 0), d.get("mem", 0)
+        if (g.get("gpc"), g.get("mem")) != (gpc, mem): self.set_offsets(gpc, mem, "desired")
+        pl1, pl2 = d.get("pl1", STOCK["pl1"]), d.get("pl2", STOCK["pl2"])
+        if (c.get("pl1"), c.get("pl2")) != (pl1, pl2): self.set_pl(pl1, pl2, "desired")
+        if d.get("profile") and c.get("profile") != d["profile"]: self.set_profile(d["profile"], "desired")
+        self.desired = d
+
+    def enforce(self):
+        L = self.limits; g = self.sample.get("gpu", {}); c = self.sample.get("cpu", {}); hits = []
+        if g.get("gpc") is not None and (g["gpc"] > L["gpc_max"] or g.get("mem", 0) > L["mem_max"]):
+            hits.append(f"gpu offset {g['gpc']}/{g.get('mem')} > cap {L['gpc_max']}/{L['mem_max']}")
+            self.set_offsets(min(g["gpc"], L["gpc_max"]), min(g.get("mem", 0), L["mem_max"]), "enforce")
+        if c.get("pl1") is not None and (c["pl1"] > L["pl1_max"] or c.get("pl2", 0) > L["pl2_max"]):
+            hits.append(f"cpu PL {c['pl1']}/{c.get('pl2')} > cap {L['pl1_max']}/{L['pl2_max']}")
+            self.set_pl(min(c["pl1"], L["pl1_max"]), min(c.get("pl2", 0), L["pl2_max"]), "enforce")
+        if g.get("temp") is not None and g["temp"] >= L["gpu_temp_max"] and (g.get("gpc", 0) > 0 or g.get("mem", 0) > 0):
+            hits.append(f"gpu {g['temp']}°C ≥ {L['gpu_temp_max']} with offsets active → stock")
+            self.set_offsets(0, 0, "thermal"); self.desired.update(gpc=0, mem=0); jsave(DESIRED_F, self.desired)
+        if c.get("temp") is not None and c["temp"] >= L["cpu_temp_max"] and c.get("pl2", 0) > STOCK["pl2"]:
+            hits.append(f"cpu {c['temp']}°C ≥ {L['cpu_temp_max']} → stock PL")
+            self.set_pl(STOCK["pl1"], STOCK["pl2"], "thermal")
+        for h in hits:
+            self.enforcements += 1; log("enforce", what=h)
+            if not os.path.exists(FLAG_F):                      # ask the AI to look at this on its next run
+                with open(FLAG_F, "w") as f: f.write("sonnet\n")
+            with open(INCIDENTS_F, "a") as f: f.write(json.dumps({"t": now(), "kind": "enforce", "what": h, "sample": self.sample}) + "\n")
+        return hits
+
+    # ---- thermal guard
+    def fan_cmd(self, c):
+        import struct
+        try:
+            s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(FAN_SOCK)
+            b = c.encode(); s.sendall(struct.pack("<I", len(b)) + b)
+            n = struct.unpack("<I", s.recv(4))[0]; r = b""
+            while len(r) < n: r += s.recv(n - len(r))
+            s.close(); return r.decode().strip()
+        except Exception as e: return f"ERROR {e}"
+    def fans_max(self):
+        if DRY: self.sim_state["fans"] = "max"; return
+        def run():
+            self.fan_cmd("SET_FAN_MODE MANUAL"); self.fan_cmd("SET_FAN_SPEED 1 5800")
+            time.sleep(10); self.fan_cmd("SET_FAN_SPEED 2 6100")          # firmware needs a gap between fan writes
+        threading.Thread(target=run, daemon=True).start()
+    def fans_release(self):
+        if DRY: self.sim_state["fans"] = "auto"; return
+        threading.Thread(target=lambda: self.fan_cmd("SET_FAN_MODE BETTER_AUTO"), daemon=True).start()
+    def thermal_guard(self):
+        L = self.limits; c = self.sample.get("cpu", {}); g = self.sample.get("gpu", {})
+        ct, gt = c.get("temp"), g.get("temp")
+        if ct is None: return
+        prev = getattr(self, "_prev_ct", ct); self._prev_ct = ct
+        spike = (ct - prev) >= int(L["spike_c"]) and ct >= int(L.get("spike_floor", 78))   # idle saw-tooth 48↔72 must not trip it
+        want = "crit" if ct >= int(L["cpu_crit"]) else "hot" if (ct >= int(L["cpu_hot"]) or spike or (gt is not None and gt >= int(L["gpu_hot"]))) else None
+        st = getattr(self, "thermal", "normal"); now_t = now()
+        if want and (want != st) and not (st == "crit" and want == "hot"):
+            pl = L["crit_pl"] if want == "crit" else L["hot_pl"]
+            why = f"thermal {want}: cpu {ct}°C (Δ{ct - prev:+d}) gpu {gt}"
+            self.fans_max(); self.set_pl(int(pl[0]), int(pl[1]), why)
+            if g.get("gpc", 0) or g.get("mem", 0): self.set_offsets(0, 0, why)
+            if want == "crit": self.set_profile("low-power", why)
+            self.thermal = want; self.thermal_since = now_t; self.thermal_cool_since = None
+            self.enforcements += 1; log("thermal.guard", state=want, cpu=ct, gpu=gt, delta=ct - prev)
+            with open(INCIDENTS_F, "a") as f: f.write(json.dumps({"t": now_t, "kind": "thermal", "what": why, "sample": self.sample}) + "\n")
+            if not os.path.exists(FLAG_F):
+                with open(FLAG_F, "w") as f: f.write("sonnet\n")
+        elif st != "normal" and not want:
+            cool = ct < int(L["cool_c"]) and (gt is None or gt < int(L["cool_c"]) - 5)
+            if cool:
+                if getattr(self, "thermal_cool_since", None) is None: self.thermal_cool_since = now_t
+                if now_t - self.thermal_cool_since >= int(L["cool_hold_s"]):
+                    self.thermal = "normal"; self.thermal_cool_since = None
+                    self.fans_release(); self.apply_desired(force=True)
+                    d = self.desired
+                    if not (d.get("pl1") and d.get("pl2")): self.set_pl(STOCK["pl1"], STOCK["pl2"], "thermal released")
+                    if c.get("profile") == "low-power" and d.get("profile") != "low-power": self.set_profile(d.get("profile") or "balanced", "thermal released")
+                    log("thermal.released", cpu=ct, gpu=gt)
+            else: self.thermal_cool_since = None
+        elif st != "normal" and want == st:
+            self.thermal_cool_since = None
+
+    def ai_proposal(self):
+        """AI may only tighten. Proposal file lives in the user's state dir."""
+        try: home = pwd.getpwnam(self.conf["user"]).pw_dir
+        except KeyError: return
+        p = f"{home}/.local/state/powerhouse/proposal.json"
+        prop = jload(p, None)
+        if not prop: return
+        changed = {}
+        recent_crash = False
+        try:
+            for l in open(INCIDENTS_F).readlines()[-50:]:
+                r = json.loads(l)
+                if r.get("kind") == "hard_crash" and now() - r.get("t", 0) < 86400: recent_crash = True
+        except (OSError, ValueError): pass
+        MAX_STEP = {"gpc_max": 50, "mem_max": 100, "pl1_max": 5, "pl2_max": 15, "kbd_pwm_hz": 25, "kbd_writes_per_s_max": 100, "gpu_temp_max": 3, "cpu_temp_max": 3}
+        for k, v in prop.get("limits", {}).items():
+            if k not in self.limits or not isinstance(v, (int, float)): continue
+            cur = self.limits[k]
+            if k == "kbd_audio_allowed" and not recent_crash: continue          # only a real crash may switch the keys off
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and k in MAX_STEP and isinstance(cur, (int, float)):
+                v = max(v, cur - MAX_STEP[k]) if v < cur else v                    # one step per run, never a cliff
+            tighter = (v < cur) if k.endswith("_max") or k == "kbd_pwm_hz" else (v > cur) if k.endswith("_min") else False
+            if k == "kbd_audio_allowed": tighter = (v is False and cur is True)
+            floors = {"gpc_max": 0, "mem_max": 0, "pl1_max": 25, "pl2_max": 65, "kbd_pwm_hz": 30, "kbd_writes_per_s_max": 60, "gpu_temp_max": 75, "cpu_temp_max": 85}
+            if tighter and k in floors and isinstance(v, (int, float)) and v < floors[k]: v = floors[k]; tighter = v < cur
+            if tighter: self.limits[k] = v; changed[k] = v
+        if changed:
+            self.limits["source"] = f"AI ({prop.get('model','?')}) {time.strftime('%Y-%m-%d %H:%M')}"
+            self.limits.setdefault("ai_history", []).append({"t": now(), "changed": changed, "reason": str(prop.get("reason", ""))[:300], "model": prop.get("model")})
+            self.limits["ai_history"] = self.limits["ai_history"][-20:]
+            jsave(LIMITS_F, self.limits); log("ai.tightened", changed=changed, reason=prop.get("reason", "")[:200])
+            with open(INCIDENTS_F, "a") as f: f.write(json.dumps({"t": now(), "kind": "ai_tightened", "what": "AI tightened " + ", ".join(f"{k}={v}" for k, v in changed.items()), "reason": str(prop.get("reason", ""))[:300]}) + "\n")
+        try: os.replace(p, p + ".applied")
+        except OSError: pass
+
+    def tick(self):
+        with self.lock:
+            self.limits = {**DEFAULT_LIMITS, **jload(LIMITS_F, {})}
+            try: lm = os.stat(LIMITS_F).st_mtime
+            except OSError: lm = 0
+            if lm != getattr(self, "_limits_mtime", None):          # caps changed (restore-defaults / loosen / AI) -> re-apply desired under the new caps
+                if getattr(self, "_limits_mtime", None) is not None: log("limits.changed", source=self.limits.get("source")); self.desired_mtime = -1
+                self._limits_mtime = lm
+            self.sample = {"t": now(), "gpu": self.gpu_sample(), "cpu": self.cpu_sample()}
+            self.ai_proposal()
+            if getattr(self, "thermal", "normal") == "normal": self.apply_desired()
+            hits = self.enforce()
+            self.thermal_guard()
+            g, c = self.sample["gpu"], self.sample["cpu"]
+            active = {"gpc": g.get("gpc", 0), "mem": g.get("mem", 0), "pl1": c.get("pl1"), "pl2": c.get("pl2"),
+                      "profile": c.get("profile"), "kbd_duty": self.kbd.duty if self.kbd else None,
+                      "kbd_pwm_active": bool(self.kbd and 0 < self.kbd.duty < 100),
+                      "kbd_writes": self.ec.writes if self.ec else 0}
+            jsave(STATE_F, {"t": now(), "active": active, "sample": self.sample, "limits": self.limits,
+                            "enforcements": self.enforcements, "uptime": round(now() - self.started)})
+    def status(self):
+        return {"version": VERSION, "uptime": round(now() - self.started), "limits": self.limits, "desired": self.desired,
+                "sample": self.sample, "enforcements": self.enforcements, "incident": self.incident,
+                "ai_review": readf(FLAG_F), "thermal": getattr(self, "thermal", "normal"),
+                "thermal_since": getattr(self, "thermal_since", None), "ec": {"writes": self.ec.writes, "disabled": self.ec.disabled, "err": self.ec.last_err,
+                "rate": len(self.ec.window)} if self.ec else None,
+                "kbd": {"duty": self.kbd.duty, "pwm_cycles": self.kbd.pwm_cycles, "enabled": self.kbd.enabled,
+                        "last_client_age": round(now() - self.kbd.last_client, 1) if self.kbd.last_client else None} if self.kbd else None}
+
+# ----------------------------------------------------------------- socket
+def serve(gov):
+    os.makedirs(RUN, exist_ok=True)
+    try: os.unlink(SOCK)
+    except OSError: pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); srv.bind(SOCK); srv.listen(16)
+    try:
+        gid = pwd.getpwnam(gov.conf["user"]).pw_gid
+        if not DRY: os.chown(SOCK, 0, gid)
+        os.chmod(SOCK, 0o660)
+    except (KeyError, PermissionError): os.chmod(SOCK, 0o666)
+    def handle(conn):
+        f = conn.makefile("rwb", buffering=0)
+        try:
+            for line in f:
+                try: req = json.loads(line.decode())
+                except ValueError: f.write(b'{"ok":false,"err":"bad json"}\n'); continue
+                resp = {"ok": True}
+                op = req.get("op")
+                if op == "kbd":
+                    if "duty" in req: gov.kbd.set(req["duty"]); resp["duty"] = gov.kbd.duty
+                    elif req.get("cmd") == "on": gov.kbd.set(100)
+                    elif req.get("cmd") == "off": gov.kbd.set(0)
+                    elif req.get("cmd") == "read":
+                        try: resp["value"] = gov.ec.read(EC.KB)
+                        except Exception as e: resp = {"ok": False, "err": str(e)}
+                elif op == "status": resp["status"] = gov.status()
+                elif op == "reload":
+                    if getattr(gov, "thermal", "normal") == "normal": gov.apply_desired(force=True)
+                    else: resp = {"ok": False, "err": f"deferred: thermal guard is {gov.thermal}; desired state re-applies on release"}
+                elif op == "ec_reset":
+                    gov.ec.disabled = False; gov.ec.window = []; gov.ec.last_err = ""
+                elif op == "clear_flag":
+                    try: os.remove(FLAG_F)
+                    except OSError: pass
+                else: resp = {"ok": False, "err": f"unknown op {op}"}
+                f.write((json.dumps(resp) + "\n").encode())
+        except (OSError, ValueError): pass
+        finally:
+            try: conn.close()
+            except OSError: pass
+    while not gov.stopping:
+        try: conn, _ = srv.accept()
+        except OSError: break
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+def main():
+    if os.geteuid() != 0 and not DRY: sys.exit("powerhouse-governor must run as root")
+    os.makedirs(ETC, exist_ok=True); os.makedirs(VAR, exist_ok=True)
+    gov = Governor()
+    if not os.path.exists(LIMITS_F): jsave(LIMITS_F, gov.limits)
+    gov.boot_check()
+    gov.ec = EC(); gov.kbd = Keyboard(gov.ec, gov); gov.kbd.start()
+    log("start", version=VERSION, limits=gov.limits)
+    def stop(sig, frm):
+        gov.stopping = True
+        try:
+            gov.kbd.enabled = False; time.sleep(0.05); gov.ec.write(EC.KB, Keyboard.ON)
+            with open(MARKER_F, "w") as f: f.write(str(now()))
+        except Exception: pass
+        log("stop.clean"); os._exit(0)
+    signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
+    threading.Thread(target=serve, args=(gov,), daemon=True).start()
+    # apply desired once at start (after a clean boot, restore what the user had)
+    gov.tick(); gov.apply_desired(force=True)
+    while True:
+        t0 = now()
+        try: gov.tick()
+        except Exception as e: log("tick.error", err=repr(e))
+        time.sleep(max(0.5, float(gov.conf.get("tick", TICK)) - (now() - t0)))
+
+if __name__ == "__main__": main()

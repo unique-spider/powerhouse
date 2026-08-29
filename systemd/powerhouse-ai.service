@@ -1,0 +1,8 @@
+[Unit]
+Description=Power House AI governor run (Claude Code headless)
+After=graphical-session.target network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/powerhouse-ai auto
+TimeoutStartSec=700

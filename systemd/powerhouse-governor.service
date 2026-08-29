@@ -1,0 +1,16 @@
+[Unit]
+Description=Power House governor (EC arbiter, limits enforcement, crash memory)
+After=multi-user.target
+ConditionPathExists=/dev/port
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/powerhouse-governor
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=8
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

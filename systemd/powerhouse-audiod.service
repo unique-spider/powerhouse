@@ -1,0 +1,12 @@
+[Unit]
+Description=Power House per-app audio routing for the keyboard light
+After=pipewire.service pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service
+
+[Service]
+ExecStart=%h/.local/bin/powerhouse-audiod
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

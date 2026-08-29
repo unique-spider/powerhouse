@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""powerhouse-apply — the ONLY writer of /etc/powerhouse/desired.json and the
+only path that can LOOSEN limits. Always invoked through pkexec (polkit action
+com.uniquespider.powerhouse.tweak, auth_admin => password every time).
+
+  set  gpc N mem N | pl1 N pl2 N | profile low-power|balanced|performance
+  stock                              everything back to firmware defaults
+  loosen KEY VALUE                   raise a cap (gpc_max, mem_max, pl1_max, pl2_max, kbd_pwm_hz, kbd_audio_allowed)
+  tighten KEY VALUE                  lower a cap (no password needed in practice, but same path)
+  ec-reset                           re-arm the EC arbiter after a rate trip
+  restore-defaults                   all caps back to installer defaults (keeps crash lock)
+  unlock-crashed gpc|mem             release the crash lock (only via powerhouse-unlock — second polkit action)
+"""
+import json, os, sys, socket, time
+
+PREFIX = os.environ.get("POWERHOUSE_PREFIX", "")
+ETC = PREFIX + "/etc/powerhouse"; DESIRED = f"{ETC}/desired.json"; LIMITS = f"{ETC}/limits.json"
+HARD = {"gpc_max": (0, 300), "mem_max": (0, 1500), "pl1_max": (10, 45), "pl2_max": (10, 115),
+        "kbd_pwm_hz": (20, 250), "kbd_writes_per_s_max": (10, 600), "gpu_temp_max": (60, 90), "cpu_temp_max": (60, 100)}
+def die(m): print(json.dumps({"ok": False, "err": m})); sys.exit(2)
+def jload(p, d):
+    try: return json.load(open(p))
+    except (OSError, ValueError): return d
+def jsave(p, o):
+    t = p + ".tmp"; json.dump(o, open(t, "w"), indent=1); os.replace(t, p)
+def poke(op):
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect("/run/powerhouse/sock")
+        s.sendall((json.dumps({"op": op}) + "\n").encode()); s.recv(4096); s.close()
+    except OSError: pass
+
+if os.geteuid() != 0 and not PREFIX: die("must run as root (via pkexec)")
+os.makedirs(ETC, exist_ok=True)
+a = sys.argv[1:]
+if not a: die(__doc__)
+lim = jload(LIMITS, {}); des = jload(DESIRED, {})
+who = os.environ.get("PKEXEC_UID", "?")
+if a[0] == "set":
+    kv = a[1:]
+    if len(kv) % 2: die("set needs key value pairs")
+    for k, v in zip(kv[::2], kv[1::2]):
+        if k in ("gpc", "mem", "pl1", "pl2"):
+            try: v = int(v)
+            except ValueError: die(f"{k} must be an integer")
+            cap = {"gpc": "gpc_max", "mem": "mem_max", "pl1": "pl1_max", "pl2": "pl2_max"}[k]
+            if cap in lim and v > lim[cap]: die(f"{k}={v} exceeds cap {cap}={lim[cap]} (use loosen first)")
+            des[k] = v
+        elif k == "profile":
+            if v not in ("low-power", "balanced", "performance"): die("bad profile")
+            des[k] = v
+        else: die(f"unknown key {k}")
+    des["by"] = who; des["t"] = time.time(); jsave(DESIRED, des); poke("reload")
+    print(json.dumps({"ok": True, "desired": des}))
+elif a[0] == "stock":
+    jsave(DESIRED, {"gpc": 0, "mem": 0, "pl1": 45, "pl2": 115, "by": who, "t": time.time()}); poke("reload")
+    print(json.dumps({"ok": True, "desired": "stock"}))
+elif a[0] in ("loosen", "tighten"):
+    if len(a) != 3: die(f"{a[0]} KEY VALUE")
+    k, v = a[1], a[2]
+    if k == "kbd_audio_allowed": v = v.lower() in ("1", "true", "yes", "on")
+    elif k in HARD:
+        try: v = int(v)
+        except ValueError: die("value must be an integer")
+        lo, hi = HARD[k]
+        if not lo <= v <= hi: die(f"{k} must be within hard bounds {lo}..{hi}")
+    else: die(f"unknown limit {k}")
+    if a[0] == "loosen":
+        locked = lim.get("crash_locked") or {}
+        key = {"gpc_max": "gpc", "mem_max": "mem"}.get(k)
+        if key and key in locked and v >= int(locked[key]):
+            die(f"{k}={v} is crash-locked: +{locked[key]} MHz preceded a hard crash. Run 'powerhouse tweak unlock-crashed {key}' (second password) to accept that risk first.")
+    lim[k] = v; lim["source"] = f"{a[0]} by uid {who} {time.strftime('%Y-%m-%d %H:%M')}"
+    jsave(LIMITS, lim); print(json.dumps({"ok": True, "limits": lim}))
+elif a[0] == "unlock-crashed":
+    # Second lock. Only reachable through /usr/local/bin/powerhouse-unlock (its own polkit action + warning).
+    if os.environ.get("POWERHOUSE_UNLOCK_GATE") != "1" and not PREFIX: die("unlock-crashed must be invoked through powerhouse-unlock")
+    if len(a) != 2 or a[1] not in ("gpc", "mem"): die("unlock-crashed gpc|mem")
+    locked = dict(lim.get("crash_locked") or {}); was = locked.pop(a[1], None)
+    lim["crash_locked"] = locked; lim["source"] = f"crash lock {a[1]} released by uid {who} {time.strftime('%Y-%m-%d %H:%M')}"
+    hist = lim.setdefault("crash_unlocks", []); hist.append({"t": time.time(), "key": a[1], "was": was, "by": who})
+    jsave(LIMITS, lim); print(json.dumps({"ok": True, "unlocked": a[1], "was": was}))
+elif a[0] == "restore-defaults":
+    # One password: put every cap back to the installer defaults, keeping the crash lock and history.
+    keep = {k: lim[k] for k in ("crash_locked", "crash_unlocks", "ai_history") if k in lim}
+    try: d = json.load(open("/usr/local/share/powerhouse/limits.default.json"))
+    except (OSError, ValueError): d = {"gpc_max": 100, "mem_max": 300, "gpc_min": -300, "mem_min": -500, "pl1_max": 45, "pl2_max": 115, "gpu_temp_max": 87, "cpu_temp_max": 95, "kbd_pwm_hz": 125, "kbd_writes_per_s_max": 400, "kbd_audio_allowed": True, "tighten_step": 50}
+    d.update(keep); d["source"] = f"restore-defaults by uid {who} {time.strftime('%Y-%m-%d %H:%M')}"
+    jsave(LIMITS, d); print(json.dumps({"ok": True, "limits": d}))
+elif a[0] == "ec-reset":
+    poke("ec_reset"); print(json.dumps({"ok": True}))
+else: die("unknown command")

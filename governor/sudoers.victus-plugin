@@ -1,0 +1,3 @@
+# Power House: only read-only and stock-restoring victus-priv operations are passwordless.
+# Clocks, offsets, power limits, EC writes, hp-wmi limits and traces require the polkit password (powerhouse-apply).
+@USER@ ALL=(root) NOPASSWD: /usr/local/bin/victus-priv power, /usr/local/bin/victus-priv cpu msr, /usr/local/bin/victus-priv ec read *, /usr/local/bin/victus-priv battery *, /usr/local/bin/victus-priv cam *, /usr/local/bin/victus-priv mic *, /usr/local/bin/victus-priv privacy *, /usr/local/bin/victus-priv gpu offset-reset, /usr/local/bin/victus-priv gpu reset, /usr/local/bin/victus-priv gpu pm *, /usr/local/bin/victus-priv gpu tgp *, /usr/local/bin/victus-priv cpu pl 45 115, /usr/local/bin/victus-priv kbd *
