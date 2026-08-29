@@ -715,11 +715,11 @@ Panel {
           Row { width: parent.width
             Column { width: parent.width; spacing: Style.space(2)
               Title { text: String(root.batt.model || "Battery") + " · " + Number(root.batt.capacity || 0) + "%" }
-              Caption { text: String(root.batt.status || "") + " · " + Number(root.batt.cycles || 0) + " CYCLES" + (root.capOn ? " · 80% CAP ON" : "") } } }
+              Caption { text: String(root.batt.status || "") + " · " + Number(root.batt.cycles || 0) + " CYCLES" + (root.capLive ? " · 80% CAP ON" : "") } } }
           Section { text: "CHARGE" }
           Meter { label: "Charge"; value: Number(root.batt.capacity || 0); maxValue: 100
             text: Number(root.batt.capacity || 0) + "% · " + Number(root.batt.energyNowWh || 0) + " / " + Number(root.batt.energyFullWh || 0) + " Wh"
-            color2: root.capOn ? root.cInsight : root.bar.foreground }
+            color2: root.capLive ? root.cInsight : root.bar.foreground }
           Row {
             width: parent.width; spacing: Style.space(20)
             Column { width: (parent.width - parent.spacing) / 2; spacing: Style.spacing.labelGap
@@ -734,11 +734,8 @@ Panel {
             Pair { label: "Health"; value: Number(battCol.tr.healthStart || 0) + "% → " + Number(battCol.tr.healthNow || 0) + "% / " + Number(battCol.tr.spanDays || 0) + " d" }
             Pair { label: "Held full on AC"; value: Number(battCol.tr.hoursAt100OnAC || 0) + " h" } }
           Section { text: "80% CHARGE CAP (HP ADAPTIVE BATTERY EXTENDER)" }
-          KillSwitch {
-            icon: "󰂄"; title: "Charge cap"; state: root.capLive ? "on" : "off"; onLabel: "ON · EC SHEN BIT"; offLabel: "OFF"
-            detail: "Read-modify-write of one EC bit through the kernel ec_sys path (not the Super I/O route). Safe; no password."
-            onToggled: function(on) { root.run(["battery", "cap", on ? "on" : "off"]) }
-          }
+          Pair { label: "Status"; value: root.capLive ? "ON · firmware-enforced" : "OFF" }
+          Note { text: "HP's EC re-asserts this bit within ~0.6 s of any attempt to clear it from software — verified, it cannot be disabled from Linux. To charge past ~80%, use BIOS: F10 → Battery Health Manager → Maximize battery." }
           Section { text: "UNPLUG REMINDER" }
           ButtonRow {
             model: [ { id: "on", icon: "󰂜", label: "Remind at 80%" }, { id: "off", icon: "󰂎", label: "Off" } ]
