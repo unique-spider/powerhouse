@@ -29,9 +29,9 @@ Install in this order — Power House orchestrates these, it doesn't replace the
 
 1. [`victus-control`](https://github.com/Batuhan4/victus-control) (upstream) —
    fan backend socket (`victus_backend.sock`) the governor's fan calls go through.
-2. [`hp-wmi-kbd`](https://github.com/unique-spider/hp-wmi-kbd) — patched
-   `hp-wmi` DKMS module (board `8BB1`) for GPU CTGP/PPAB and CPU-PL WMI paths.
-   Skip if you don't need those.
+2. [`hp-wmi-victus-8bb1`](https://github.com/unique-spider/hp-wmi-victus-8bb1) —
+   patched `hp-wmi` DKMS module (board `8BB1`) for GPU CTGP/PPAB and CPU-PL WMI
+   paths. Skip if you don't need those.
 3. [`victus-toolkit`](https://github.com/unique-spider/victus-toolkit) —
    `victus-priv`, `victus-gpu-nvml`, and friends that the governor and
    sudoers rule (`governor/sudoers.victus-plugin`) call into.
@@ -96,6 +96,39 @@ sudo ./install.sh
 omarchy-plugin-enable uniquespider.powerhouse center
 omarchy-plugin-disable anbuselvan.victus       # optional: the old widget
 ```
+
+## Uninstall
+
+There's no `uninstall.sh` yet — remove it by hand:
+
+```sh
+# Bar plugin
+omarchy plugin disable uniquespider.powerhouse
+rm -rf ~/.config/omarchy/plugins/uniquespider.powerhouse
+
+# User-level services
+systemctl --user disable --now powerhouse-audiod.service powerhouse-ai.timer
+rm -f ~/.config/systemd/user/powerhouse-{audiod,ai}.service ~/.config/systemd/user/powerhouse-ai.timer
+rm -f ~/.local/bin/powerhouse ~/.local/bin/powerhouse-audiod ~/.local/bin/powerhouse-ai
+rm -rf ~/.config/powerhouse ~/.local/state/powerhouse   # drops AI usage history and your audio exclusions
+
+# Root-level (governor, polkit, sudoers)
+sudo systemctl disable --now powerhouse-governor.service
+sudo rm -f /etc/systemd/system/powerhouse-governor.service
+sudo rm -f /usr/local/bin/powerhouse-governor /usr/local/bin/powerhouse-apply /usr/local/bin/powerhouse-unlock
+sudo rm -f /usr/share/polkit-1/actions/com.uniquespider.powerhouse.policy
+sudo rm -f /etc/sudoers.d/victus-plugin
+sudo rm -rf /etc/powerhouse /var/lib/powerhouse /usr/local/share/powerhouse
+sudo systemctl daemon-reload
+```
+
+`kbdlight-helper` is replaced in place (not removed) — it's shared with the
+`victus-toolkit` keyboard-brightness path. If `install.sh` found a **setuid**
+kbdlight-helper before overwriting it, it saved that original binary as
+`/usr/local/bin/kbdlight-helper.setuid.bak`. Do not restore it: a setuid
+helper poking EC RAM from a second process was the original cause of the
+hard crashes this project exists to fix (see "Why it exists" above) — it's
+kept only as a reference, not something to reinstate.
 
 Either way, `install.sh` must be run with `sudo` as your normal user (not
 directly as `root`) — it reads `$SUDO_USER` and fails loudly if that's unset.
