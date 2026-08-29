@@ -135,40 +135,51 @@ the plugin loads and shows temperatures fine, but most tab actions will fail.
 
 ## Step 1 — Install
 
-**Option A — via the Omarchy plugin marketplace** (clones straight into
-`~/.config/omarchy/plugins/uniquespider.powerhouse/`):
+### One-click (recommended)
+
+Two commands, **one** password dialog (a native polkit "Authenticate" popup
+via `pkexec` — not a terminal `sudo` prompt) covering every root step across
+Power House *and* its 3 prerequisites:
 
 ```sh
-# 1. Add the plugin (downloads the repo, does not touch your system yet)
-omarchy plugin add https://github.com/unique-spider/powerhouse.git --yes
-
-# 2. Run the installer — this is the one point that asks for your password
-sudo ~/.config/omarchy/plugins/uniquespider.powerhouse/install.sh
-
-# 3. Turn the bar widget on
-omarchy plugin enable uniquespider.powerhouse --section center
+omarchy plugin add https://github.com/unique-spider/powerhouse.git --enable --yes
+~/.config/omarchy/plugins/uniquespider.powerhouse/install-all.sh
 ```
 
-**Option B — manual clone**, if you'd rather keep a dev checkout somewhere
-of your choosing:
+`install-all.sh` clones the 3 prerequisite repos (into
+`~/.local/share/powerhouse-deps/`, or `$POWERHOUSE_DEPS_DIR` if you set it),
+asks you exactly one yes/no question — whether to also build the optional
+`hp-wmi-victus-8bb1` kernel-module patch — then runs every install script,
+including its own, behind that single authentication dialog. It refuses to
+run as root itself (`./install-all.sh`, no `sudo`) and elevates only once,
+internally. Nothing is hidden: it's ~90 lines, plain to read before you run
+it, and every script it calls is one you can also run by hand (below).
+
+### Manual, step by step
+
+If you'd rather review and run each piece yourself instead of one script
+doing it all:
 
 ```sh
 # 1. Clone it anywhere
 git clone https://github.com/unique-spider/powerhouse.git && cd powerhouse
 
-# 2. Install (asks for your password once)
+# 2. Install the 3 prerequisites first (see Prerequisites above) — each has
+#    its own `sudo ./install.sh` / `sudo ./install-hpwmi.sh` in its README
+
+# 3. Install Power House itself (asks for your password once)
 sudo ./install.sh
 
-# 3. Turn the bar widget on
+# 4. Turn the bar widget on
 omarchy-plugin-enable uniquespider.powerhouse center
 
-# 4. Optional: turn off the older, unrelated Victus widget if you have it
+# 5. Optional: turn off the older, unrelated Victus widget if you have it
 omarchy-plugin-disable anbuselvan.victus
 ```
 
-Either way, `install.sh` must be run with `sudo` as **your normal user**
-(not logged in directly as `root`) — it reads `$SUDO_USER` to know who you
-are, and refuses to run if that's unset.
+Either way, every `install.sh` in this stack must be run as **your normal
+user** (`sudo ./install.sh`, never logged in directly as `root`) — each one
+reads `$SUDO_USER` to know who you are and refuses to run if that's unset.
 
 ## How the root access actually works
 
