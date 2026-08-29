@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""powerhouse — user-side CLI behind the Power House bar plugin.
+
+  status                      JSON for every tab (victus sections + governor + keys routing + ai)
+  gov status|reload|ec-reset  governor socket ops (ec-reset needs password)
+  tweak set K V [K V…]        privileged change via pkexec (password prompt): gpc/mem/pl1/pl2/profile
+  tweak stock                 back to firmware defaults (password)
+  tweak loosen K V | tighten K V | restore-defaults (one password)
+  keys audio on|off|toggle    audio-reactive keys (through the governor)
+  keys exclude add|remove APP | enable | disable | list
+  keys budget HZ WRITES       EC budget (tighten free; loosen prompts)
+  ai review|crash|auto|ask …  run the AI governor now
+  power profile P             powerprofilesctl (no password)
+  mic on|off|status           user-level mic kill (WirePlumber rule + mute; never kills PipeWire)
+  fan …  battery …  guard …   passthrough to victusctl
+"""
+import json, os, socket, subprocess, sys, time
+H = os.path.expanduser("~")
+VICTUSCTL = f"{H}/.local/bin/victusctl"; AUDIOCTL = f"{H}/.local/bin/kbd-audioctl"; AI = f"{H}/.local/bin/powerhouse-ai"
+AUDIO_CONF = f"{H}/.config/powerhouse/audio.json"; AUDIOD_STATE = f"{H}/.local/state/powerhouse/audiod.json"
+AI_CONF = f"{H}/.config/powerhouse/ai.json"; AI_LOG = f"{H}/.local/state/powerhouse/ai-runs.jsonl"
+LESSONS = f"{H}/.local/state/powerhouse/lessons.md"
+APPLY = "/usr/local/bin/powerhouse-apply"
+def jload(p, d):
+    try: return json.load(open(p))
+    except (OSError, ValueError): return d
+def jsave(p, o):
+    os.makedirs(os.path.dirname(p), exist_ok=True); t = p + ".tmp"; json.dump(o, open(t, "w"), indent=1); os.replace(t, p)
+def sh(cmd, timeout=30):
+    try: r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout); return r.stdout.strip() or r.stderr.strip()
+    except Exception as e: return f"ERROR: {e}"
+def gov(op):
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect("/run/powerhouse/sock")
+        s.sendall((json.dumps({"op": op}) + "\n").encode()); b = b""
+        while not b.endswith(b"\n"):
+            c = s.recv(65536)
+            if not c: break
+            b += c
+        s.close(); return json.loads(b or b"{}")
+    except Exception as e: return {"ok": False, "err": str(e)}
+def tail_jsonl(p, n):
+    try: return [json.loads(l) for l in open(p).readlines()[-n:] if l.strip()]
+    except (OSError, ValueError): return []
+def timeline(n=40):
+    """Everything the guards did, newest first: guardian alerts, governor incidents/events, AI runs."""
+    ev = []
+    for r in tail_jsonl(f"{H}/.local/state/victus-plugin/alerts.jsonl", 60):
+        ev.append({"t": r.get("t", 0), "src": "guardian", "kind": r.get("kind", ""), "title": r.get("title", ""), "detail": str(r.get("body", ""))[:160],
+                   "level": "bad" if r.get("critical") else "warn"})
+    for r in tail_jsonl("/var/lib/powerhouse/incidents.jsonl", 60):
+        k = r.get("kind", "")
+        ev.append({"t": r.get("t", 0), "src": "governor", "kind": k,
+                   "title": {"hard_crash": "Hard crash detected — caps tightened", "enforce": "Cap enforced", "thermal": "Thermal guard"}.get(k, k),
+                   "detail": str(r.get("what") or json.dumps(r.get("changed", {})))[:160], "level": "bad" if k == "hard_crash" else "warn"})
+    for r in tail_jsonl("/var/lib/powerhouse/events.jsonl", 200):
+        m = r.get("msg", "")
+        names = {"thermal.released": "Thermal guard released", "ec.tripped": "EC write budget tripped", "ai.tightened": "AI tightened limits",
+                 "boot.crash_detected": "Boot after crash", "boot.clean": "Clean boot", "start": "Governor started"}
+        if m in names:
+            ev.append({"t": r.get("t", 0), "src": "governor", "kind": m, "title": names[m],
+                       "detail": json.dumps({k: v for k, v in r.items() if k not in ("t", "msg", "limits")})[:160],
+                       "level": "bad" if m == "ec.tripped" else "info" if m in ("boot.clean", "start") else "warn"})
+    for r in tail_jsonl(AI_LOG, 30):
+        ev.append({"t": r.get("t", 0), "src": "ai", "kind": r.get("kind", ""),
+                   "title": ("AI skipped: " + r["skipped"]) if r.get("skipped") else "AI " + str(r.get("kind", "")) + " (" + str(r.get("model", "")).replace("claude-", "") + ")",
+                   "detail": (str(r.get("tokens", 0)) + " tokens") if not r.get("skipped") else "", "level": "info"})
+    ev.sort(key=lambda e: -float(e.get("t") or 0)); return ev[:n]
+def status():
+    try: v = json.loads(sh([VICTUSCTL, "status"], 40))
+    except ValueError: v = {}
+    g = gov("status"); gs = g.get("status") if g.get("ok") else None
+    inc = tail_jsonl("/var/lib/powerhouse/incidents.jsonl", 8)
+    aud = jload(AUDIOD_STATE, {}); aconf = jload(AUDIO_CONF, {"enabled": True, "excluded": []})
+    ai = {"conf": {**{"model_review": "claude-sonnet-5", "model_crash": "claude-opus-5", "enabled": True}, **jload(AI_CONF, {})},
+          "runs": tail_jsonl(AI_LOG, 5), "lessons_tail": "", "usage": {}}
+    try: ai["usage"] = json.loads(sh([AI, "usage"], 10))
+    except ValueError: pass
+    try: ai["lessons_tail"] = "".join(open(LESSONS).readlines()[-14:])
+    except OSError: pass
+    units = {}
+    for u, scope in (("powerhouse-governor", "system"), ("powerhouse-audiod", "user"), ("powerhouse-ai.timer", "user"), ("victus-guardian", "user")):
+        units[u] = sh(["systemctl"] + (["--user"] if scope == "user" else []) + ["is-active", u], 5)
+    v["governor"] = {"online": gs is not None, "err": g.get("err") if gs is None else None, **(gs or {}), "incidents": inc, "units": units}
+    v["keys"] = {"routing": aud, "excluded": aconf.get("excluded", []), "routingEnabled": aconf.get("enabled", True)}
+    v["ai"] = ai
+    v["stock"] = {"gpc": 0, "mem": 0, "pl1": 45, "pl2": 115}
+    v["timeline"] = timeline()
+    v.setdefault("privacy", {})["micUser"] = mic("status")
+    return v
+MIC_CONF = f"{H}/.config/wireplumber/wireplumber.conf.d/90-powerhouse-mic-off.conf"
+def mic(state):
+    """Disable all ALSA capture nodes at the WirePlumber layer + hard-mute capture. The card
+    stays enumerated (speakers/HDMI/jack keep working) and PipeWire is never killed, so
+    playing apps keep their streams. Only WirePlumber is restarted to apply the rule."""
+    if state == "status": return "off" if os.path.exists(MIC_CONF) else "on"
+    os.makedirs(os.path.dirname(MIC_CONF), exist_ok=True)
+    if state == "off":
+        open(MIC_CONF, "w").write('# Power House mic off\nmonitor.alsa.rules = [\n  { matches = [ { node.name = "~alsa_input.*" } ]\n    actions = { update-props = { node.disabled = true } } }\n]\n')
+        subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "1"], capture_output=True)
+    else:
+        try: os.remove(MIC_CONF)
+        except OSError: pass
+    # WirePlumber restart can flip the default output (e.g. EarPods -> speakers); remember and restore it.
+    prev_sink = sh(["pactl", "get-default-sink"], 5)
+    subprocess.run(["systemctl", "--user", "restart", "wireplumber"], capture_output=True)
+    for _ in range(20):
+        time.sleep(0.25)
+        if prev_sink and prev_sink in sh(["pactl", "list", "short", "sinks"], 5):
+            subprocess.run(["pactl", "set-default-sink", prev_sink], capture_output=True); break
+    for c in ("Capture", "Dmic0", "Dmic1 2nd", "Mic Boost"):
+        subprocess.run(["amixer", "-q", "-c", "sofhdadsp", "sset", c, "nocap" if state == "off" else "cap"], capture_output=True)
+    if state == "on": subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "0"], capture_output=True)
+    return f"mic {state}"
+def main(a):
+    if not a or a[0] == "status": print(json.dumps(status())); return
+    c = a[0]
+    if c == "gov":
+        if a[1:2] == ["ec-reset"]: print(sh(["pkexec", APPLY, "ec-reset"], 120)); return
+        print(json.dumps(gov(a[1] if len(a) > 1 else "status")))
+    elif c == "tweak":
+        if a[1:2] == ["unlock-crashed"] and len(a) > 2: print(sh(["pkexec", "/usr/local/bin/powerhouse-unlock", a[2]], 120)); return
+        print(sh(["pkexec", APPLY] + a[1:], 120))
+    elif c == "keys":
+        sub = a[1] if len(a) > 1 else "status"
+        if sub == "audio":
+            m = a[2] if len(a) > 2 else "toggle"
+            print(sh([AUDIOCTL, {"on": "start", "off": "off", "toggle": "toggle"}.get(m, m)] + a[3:]))
+        elif sub == "exclude":
+            conf = jload(AUDIO_CONF, {"enabled": True, "excluded": []}); ex = [x.lower() for x in conf.get("excluded", [])]
+            if a[2:3] == ["add"] and len(a) > 3: ex = sorted(set(ex + [a[3].lower()]))
+            elif a[2:3] == ["remove"] and len(a) > 3: ex = [x for x in ex if x != a[3].lower()]
+            elif a[2:3] == ["enable"]: conf["enabled"] = True
+            elif a[2:3] == ["disable"]: conf["enabled"] = False
+            conf["excluded"] = ex; jsave(AUDIO_CONF, conf); print(json.dumps(conf))
+        elif sub == "budget" and len(a) > 3:
+            lim = jload("/etc/powerhouse/limits.json", {}); hz, w = int(a[2]), int(a[3]); out = []
+            for k, v in (("kbd_pwm_hz", hz), ("kbd_writes_per_s_max", w)):
+                op = "tighten" if v <= int(lim.get(k, 10**9)) else "loosen"
+                out.append(sh(["pkexec", APPLY, op, k, str(v)], 120))
+            print("\n".join(out))
+        else: print(json.dumps(status()["keys"]))
+    elif c == "ai":
+        os.execv(AI, [AI] + a[1:])
+    elif c == "power" and a[1:2] == ["profile"] and len(a) > 2:
+        print(sh(["powerprofilesctl", "set", a[2]]))
+    elif c == "mic":
+        print(mic(a[1] if len(a) > 1 else "status"))
+    elif c in ("fan", "battery", "guard", "clamshell", "cam", "privacy", "auto", "revert"):
+        os.execv(VICTUSCTL, [VICTUSCTL] + a)
+    else: print(__doc__); sys.exit(2)
+if __name__ == "__main__": main(sys.argv[1:])

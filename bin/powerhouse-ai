@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""powerhouse-ai — the AI half of the governor. Runs Claude Code headless.
+
+  review   periodic health review (Sonnet 5): telemetry + memory -> lessons.md, may propose TIGHTER limits
+  crash    post-crash root cause (Opus 5): incident + journal -> lessons.md, proposal.json
+  auto     decide from the governor's ai-review flag (crash if set, else review)
+  ask "…"  one-off question with full memory context (Sonnet 5)
+
+Memory (persistent, read on every run):
+  ~/.local/state/powerhouse/lessons.md      what was learned and why (AI-written, human-readable)
+  ~/.local/state/powerhouse/incidents.jsonl  copied from the governor
+  /etc/powerhouse/limits.json                enforced caps
+Proposals can only tighten; loosening always needs the password (powerhouse-apply loosen).
+"""
+import json, os, subprocess, sys, time, shutil
+
+H = os.path.expanduser("~")
+ST = f"{H}/.local/state/powerhouse"; os.makedirs(ST, exist_ok=True)
+LESSONS = f"{ST}/lessons.md"; PROPOSAL = f"{ST}/proposal.json"; LOG = f"{ST}/ai-runs.jsonl"
+CONF = f"{H}/.config/powerhouse/ai.json"
+DEFAULT = {"model_review": "claude-sonnet-5", "model_crash": "claude-opus-5", "max_turns": 2, "enabled": True,
+           # Budget: keep the governor well inside ~5-10 % of a 5-hour Claude session.
+           "budget_window_h": 5, "budget_runs": 8, "budget_tokens": 120000, "budget_opus_runs": 2, "max_usd_per_run": 0.6}
+USAGE = f"{ST}/usage.jsonl"
+def jload(p, d):
+    try: return json.load(open(p))
+    except (OSError, ValueError): return d
+def sh(cmd, timeout=60):
+    try: return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception as e: return f"(error: {e})"
+def gov(op):
+    import socket
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect("/run/powerhouse/sock")
+        s.sendall((json.dumps({"op": op}) + "\n").encode()); b = b""
+        while not b.endswith(b"\n"): c = s.recv(65536); b += c; 
+        s.close(); return json.loads(b)
+    except Exception as e: return {"ok": False, "err": str(e)}
+def usage_window(conf):
+    """Tokens and runs consumed in the rolling budget window, from usage.jsonl."""
+    win = float(conf.get("budget_window_h", 5)) * 3600; t0 = time.time() - win
+    rows = []
+    try:
+        for l in open(USAGE):
+            try: r = json.loads(l)
+            except ValueError: continue
+            if r.get("t", 0) >= t0: rows.append(r)
+    except OSError: pass
+    tok = sum(int(r.get("tokens", 0)) for r in rows); opus = sum(1 for r in rows if "opus" in str(r.get("model", "")))
+    cost = sum(float(r.get("cost_usd", 0) or 0) for r in rows)
+    lifetime = {"runs": 0, "tokens": 0, "cost_usd": 0.0}
+    try:
+        for l in open(USAGE):
+            try: r = json.loads(l)
+            except ValueError: continue
+            lifetime["runs"] += 1; lifetime["tokens"] += int(r.get("tokens", 0)); lifetime["cost_usd"] += float(r.get("cost_usd", 0) or 0)
+    except OSError: pass
+    bt = int(conf.get("budget_tokens", 120000)); br = int(conf.get("budget_runs", 8))
+    return {"window_h": conf.get("budget_window_h", 5), "runs": len(rows), "tokens": tok, "opus_runs": opus, "cost_usd": round(cost, 4),
+            "budget_runs": br, "budget_tokens": bt, "budget_opus_runs": int(conf.get("budget_opus_runs", 2)),
+            "pct_tokens": round(100.0 * tok / max(1, bt), 1), "pct_runs": round(100.0 * len(rows) / max(1, br), 1),
+            "lifetime": {**lifetime, "cost_usd": round(lifetime["cost_usd"], 4)}}
+def budget_ok(conf, kind):
+    u = usage_window(conf)
+    if u["runs"] >= u["budget_runs"]: return False, f"run budget used ({u['runs']}/{u['budget_runs']} in {u['window_h']} h)"
+    if u["tokens"] >= u["budget_tokens"]: return False, f"token budget used ({u['tokens']}/{u['budget_tokens']} in {u['window_h']} h)"
+    if kind == "crash" and u["opus_runs"] >= u["budget_opus_runs"]: return False, f"Opus budget used ({u['opus_runs']}/{u['budget_opus_runs']})"
+    return True, ""
+def context(kind):
+    st = gov("status").get("status", {})
+    inc = sh(["tail", "-n", "12", "/var/lib/powerhouse/incidents.jsonl"])
+    ev = sh(["tail", "-n", "40", "/var/lib/powerhouse/events.jsonl"])
+    hist = sh(["tail", "-n", "60", f"{H}/.local/state/victus-plugin/history.jsonl"])
+    boots = sh(["journalctl", "--list-boots", "--no-pager"])[-1500:]
+    lessons = open(LESSONS).read() if os.path.exists(LESSONS) else "(empty)"
+    slim = {k: st.get(k) for k in ("limits", "desired", "sample", "enforcements", "incident", "ai_review", "ec", "kbd", "uptime")}
+    parts = [f"# Governor status\n{json.dumps(slim)[:3500]}", f"# Recent incidents\n{inc[-3500:]}",
+             f"# Governor events\n{ev[-2500:]}", f"# Guardian samples (5s, newest last)\n{hist[-2500:]}", f"# Boots\n{boots[-900:]}",
+             f"# lessons.md (your memory)\n{lessons[-7000:]}"]
+    if kind == "crash":
+        parts.append("# Previous boot, last 50 lines (noise filtered)\n" + sh(["bash", "-c",
+            "journalctl -b -1 --no-pager -q 2>/dev/null | grep -vE 'Client (dis)?connected|UFW BLOCK|voxtype|pam_unix' | tail -50 | cut -c1-160"], 90)[-6000:])
+        parts.append("# Previous boot kernel warnings\n" + sh(["bash", "-c", "journalctl -b -1 -k -p warning --no-pager -q | grep -v UFW | tail -20 | cut -c1-160"], 90)[-2500:])
+    return "\n\n".join(parts)
+PROMPT = """You are the AI governor of an HP Victus 15 (i7-13620H, RTX 4050) running Omarchy Linux.
+A deterministic daemon (powerhouse-governor) enforces limits.json every 3 s; you are its analyst and memory.
+Rules: (1) you may only propose TIGHTER limits (lower *_max, lower kbd_pwm_hz, kbd_audio_allowed=false); loosening is the human's decision behind a password.
+(2) Base every conclusion on the evidence below; say what is proven vs inferred. (3) Never repeat a tweak that preceded a crash.
+Known history: continuous EC soft-PWM from a setuid helper (Super I/O 0x2E/0x2F, non-atomic, multiple writers) preceded a crash spike; direct MSR 0x610 writes preceded two power-cuts on 2026-08-28; a +200/+600 MHz GPU offset was active during the 23:19 crash.
+
+TASK ({kind}): {task}
+
+Respond with EXACTLY this structure:
+## Diagnosis
+(concise)
+## Lessons
+(bullet list of durable rules to remember; only new ones)
+## Proposal
+```json
+{{"limits": {{}}, "reason": "..."}}
+```
+(empty limits object if nothing should change)
+
+{ctx}"""
+TASKS = {"review": "Periodic health review. Check temperatures, enforcement count, EC write rate, active offsets vs caps, thermal drift. Recommend only if evidence warrants.",
+         "crash": "The previous boot ended in a hard crash (no shutdown logged). Determine the most likely mechanism from the last-state snapshot, active tweaks, and journal tail. Propose limits that prevent recurrence."}
+def run(kind, question=None):
+    conf = {**DEFAULT, **jload(CONF, {})}
+    if not conf.get("enabled", True): print("ai disabled"); return 0
+    ok, why = budget_ok(conf, kind)
+    if not ok and not os.environ.get("POWERHOUSE_AI_FORCE"):
+        with open(LOG, "a") as f: f.write(json.dumps({"t": time.time(), "kind": kind, "skipped": why}) + "\n")
+        print(f"skipped: {why}"); return 0
+    claude = shutil.which("claude") or f"{H}/.local/share/mise/installs/claude/latest/claude"
+    model = conf["model_crash"] if kind == "crash" else conf["model_review"]
+    task = question if kind == "ask" else TASKS[kind]
+    prompt = PROMPT.format(kind=kind, task=task, ctx=context(kind))
+    t0 = time.time()
+    # prompt goes over stdin: --tools is variadic and would swallow a positional prompt
+    # Lean mode: no MCP servers / skills / default system prompt — otherwise Claude Code's own startup context costs ~80k tokens per run (measured: 283 with these flags).
+    sys_prompt = "You are the AI governor of an HP Victus laptop running Omarchy Linux. Answer only from the evidence given. Be concise."
+    r = subprocess.run([claude, "-p", "--model", model, "--max-turns", str(conf["max_turns"]), "--output-format", "json",
+                        "--strict-mcp-config", "--disable-slash-commands",
+                        "--no-session-persistence", "--system-prompt", sys_prompt, "--max-budget-usd", str(conf.get("max_usd_per_run", 0.6)),
+                        "--tools", ""], input=prompt, capture_output=True, text=True, timeout=600)
+    out = r.stdout.strip(); usage = {}; cost = 0.0
+    try:
+        j = json.loads(out); out = str(j.get("result", "")); usage = j.get("usage", {}) or {}; cost = float(j.get("total_cost_usd", 0) or 0)
+    except ValueError: out = out or r.stderr.strip()
+    tokens = int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0)) + int(usage.get("cache_creation_input_tokens", 0)) + int(usage.get("cache_read_input_tokens", 0))
+    rec = {"t": t0, "kind": kind, "model": model, "secs": round(time.time() - t0, 1), "rc": r.returncode, "chars": len(out), "tokens": tokens, "cost_usd": cost}
+    if tokens > 0 or r.returncode == 0:
+        with open(USAGE, "a") as f: f.write(json.dumps({"t": t0, "kind": kind, "model": model, "tokens": tokens, "cost_usd": cost, "usage": usage}) + "\n")
+    # lessons
+    les = ""
+    if "## Lessons" in out:
+        les = out.split("## Lessons", 1)[1].split("## Proposal", 1)[0].strip()
+    if les and not les.lower().lstrip("-• ").startswith(("(none", "none", "no new")):
+        with open(LESSONS, "a") as f: f.write(f"\n### {time.strftime('%Y-%m-%d %H:%M')} — {kind} ({model})\n{les}\n")
+    # proposal
+    if "```json" in out:
+        try:
+            prop = json.loads(out.split("```json", 1)[1].split("```", 1)[0])
+            if prop.get("limits"):
+                prop["model"] = model; prop["t"] = t0; json.dump(prop, open(PROPOSAL, "w")); rec["proposal"] = prop["limits"]
+        except ValueError: rec["proposal_error"] = True
+    open(f"{ST}/last-{kind}.md", "w").write(out)
+    with open(LOG, "a") as f: f.write(json.dumps(rec) + "\n")
+    if kind == "crash" and r.returncode == 0: gov("clear_flag")
+    print(out); return r.returncode
+if __name__ == "__main__":
+    a = sys.argv[1:] or ["auto"]
+    if a[0] == "usage":
+        print(json.dumps(usage_window({**DEFAULT, **jload(CONF, {})}), indent=1)); sys.exit(0)
+    if a[0] == "auto":
+        flag = str(gov("status").get("status", {}).get("ai_review") or "").strip()
+        rc = run("crash" if flag == "opus" else "review")
+        if flag == "sonnet" and rc == 0: gov("clear_flag")
+        sys.exit(rc)
+    elif a[0] == "ask": sys.exit(run("ask", " ".join(a[1:]) or "Summarize the current state and risks."))
+    elif a[0] in TASKS: sys.exit(run(a[0]))
+    else: print(__doc__); sys.exit(2)

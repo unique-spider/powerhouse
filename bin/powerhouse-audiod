@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""powerhouse-audiod — per-app routing for the audio-reactive keyboard light.
+
+Every playback stream normally lands in the `kbd-mix` virtual sink (static
+PipeWire rules) whose monitor drives the keys. Apps listed in
+~/.config/powerhouse/audio.json "excluded" are moved straight to the real
+output instead, so you hear them but the keys ignore them. Runs as a user
+service; reacts to `pactl subscribe` events, re-checks every 5 s as a safety net.
+"""
+import json, os, re, subprocess, sys, time, threading, select
+
+CONF = os.path.expanduser("~/.config/powerhouse/audio.json")
+STATE = os.path.expanduser("~/.local/state/powerhouse/audiod.json")
+MIX = "kbd-mix"
+def jload(p, d):
+    try: return json.load(open(p))
+    except (OSError, ValueError): return d
+def jsave(p, o):
+    os.makedirs(os.path.dirname(p), exist_ok=True); t = p + ".tmp"; json.dump(o, open(t, "w"), indent=1); os.replace(t, p)
+def sh(*cmd, timeout=5):
+    try: return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception: return ""
+def real_sink():
+    s = sh("pw-metadata", "-n", "default", "0", "default.audio.sink")
+    m = re.search(r'"name":"([^"]+)"', s)
+    if m and m.group(1) != MIX: return m.group(1)
+    for l in sh("pactl", "list", "short", "sinks").splitlines():
+        p = l.split("\t")
+        if len(p) > 1 and p[1] != MIX and not p[1].endswith(".monitor"): return p[1]
+    return None
+def streams():
+    try: items = json.loads(sh("pactl", "-f", "json", "list", "sink-inputs") or "[]")
+    except ValueError: items = []
+    try: clients = {c["index"]: c.get("properties", {}) for c in json.loads(sh("pactl", "-f", "json", "list", "clients") or "[]")}
+    except ValueError: clients = {}
+    try: sinks = {s["index"]: s["name"] for s in json.loads(sh("pactl", "-f", "json", "list", "sinks") or "[]")}
+    except ValueError: sinks = {}
+    out = []
+    for it in items:
+        p = it.get("properties", {}); cp = clients.get(it.get("client"), {}) if isinstance(it.get("client"), int) else {}
+        if p.get("node.name") == "kbd-mix-loop-out": continue
+        ident = {"binary": (p.get("application.process.binary") or cp.get("application.process.binary") or "").lower(),
+                 "app": (p.get("application.name") or cp.get("application.name") or "").lower(),
+                 "node": (p.get("node.name") or "").lower()}
+        out.append({"index": it["index"], "sink": sinks.get(it.get("sink"), ""), "ident": ident,
+                    "label": p.get("application.name") or cp.get("application.name") or p.get("node.name") or "?",
+                    "media": p.get("media.name", "")})
+    return out
+def excluded_match(st, excluded):
+    i = st["ident"]
+    for e in excluded:
+        e = e.lower()
+        if e and (e == i["binary"] or e == i["app"] or e == i["node"]): return True
+    return False
+def reconcile(conf, last_state):
+    hw = real_sink(); if_mix = any(l.split("\t")[1] == MIX for l in sh("pactl", "list", "short", "sinks").splitlines() if "\t" in l)
+    moved = []
+    sts = streams()
+    if hw and if_mix and conf.get("enabled", True):
+        for st in sts:
+            want = hw if excluded_match(st, conf.get("excluded", [])) else MIX
+            if st["sink"] != want and st["sink"]:
+                subprocess.run(["pactl", "move-sink-input", str(st["index"]), want], capture_output=True)
+                moved.append((st["label"], want)); st["sink"] = want
+    jsave(STATE, {"t": time.time(), "hw": hw, "mix": if_mix, "streams": sts, "moved": moved,
+                  "excluded": conf.get("excluded", []), "enabled": conf.get("enabled", True)})
+    return moved
+def main():
+    conf = jload(CONF, {"enabled": True, "excluded": ["discord"]})
+    if not os.path.exists(CONF): jsave(CONF, conf)
+    mtime = 0
+    reconcile(conf, None)
+    while True:
+        try:
+            sub = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            time.sleep(5); continue
+        pending = 0.0
+        while sub.poll() is None:
+            r, _, _ = select.select([sub.stdout], [], [], 0.5)
+            if r:
+                line = sub.stdout.readline()
+                if re.search(r"Event '(new|change)' on (sink-input|sink|server)", line): pending = time.time() + 0.15
+            try: m = os.stat(CONF).st_mtime
+            except OSError: m = 0
+            if m != mtime: mtime = m; conf = jload(CONF, conf); pending = time.time()
+            if pending and time.time() >= pending:
+                pending = 0.0
+                try: reconcile(conf, None)
+                except Exception as e: print("reconcile error", e, file=sys.stderr)
+            if int(time.time()) % 5 == 0 and not pending: pending = time.time() + 0.9
+        time.sleep(2)
+if __name__ == "__main__": main()

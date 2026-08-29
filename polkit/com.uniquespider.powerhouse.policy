@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Power House</vendor>
+  <action id="com.uniquespider.powerhouse.tweak">
+    <description>Change Power House tuning (clocks, power limits, caps)</description>
+    <message>Power House needs your password to change a hardware tuning setting</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/powerhouse-apply</annotate>
+  </action>
+  <action id="com.uniquespider.powerhouse.unlock-crashed">
+    <description>Release a crash lock in Power House</description>
+    <message>CRASH LOCK: this GPU offset preceded a hard crash of this laptop. Enter your password only if you accept that risk.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/powerhouse-unlock</annotate>
+  </action>
+</policyconfig>

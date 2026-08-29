@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "uniquespider.powerhouse",
+  "name": "Power House",
+  "version": "1.0.0",
+  "author": "uniquespider",
+  "license": "MIT",
+  "description": "Governed laptop control for the HP Victus: keys, overclock (capped, password-gated), fans, power, guard, battery, system and the AI governor.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "plugin/PowerHouse.qml" },
+  "barWidget": {
+    "displayName": "Power House",
+    "description": "One dashboard per domain; every hardware tweak is capped by the governor and needs your password.",
+    "category": "System",
+    "aliases": ["powerhouse", "victus", "governor", "overclock", "fan", "keys", "battery"],
+    "defaultSection": "center",
+    "allowMultiple": false
+  }
+}

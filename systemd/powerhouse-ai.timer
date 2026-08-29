@@ -1,0 +1,10 @@
+[Unit]
+Description=Power House AI governor: review at login and every 30 minutes
+
+[Timer]
+OnStartupSec=3min
+OnUnitActiveSec=30min
+AccuracySec=2min
+
+[Install]
+WantedBy=timers.target

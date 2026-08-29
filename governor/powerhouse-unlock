@@ -1,0 +1,7 @@
+#!/bin/bash
+# powerhouse-unlock — the SECOND lock. Releases a crash-locked offset so a later
+# 'loosen' may reach it. Has its own polkit action with an explicit crash warning.
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo '{"ok":false,"err":"run via pkexec"}'; exit 2; }
+[[ ${1:-} =~ ^(gpc|mem)$ ]] || { echo '{"ok":false,"err":"usage: powerhouse-unlock gpc|mem"}'; exit 2; }
+POWERHOUSE_UNLOCK_GATE=1 exec /usr/local/bin/powerhouse-apply unlock-crashed "$1"
