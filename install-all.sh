@@ -58,9 +58,26 @@ trap 'rm -f "$ROOT_SCRIPT"' EXIT
   echo "echo '-- victus-toolkit (victus-priv, victusctl, victus-fanctl)'"
   echo "cd $(printf '%q' "$DEPS_DIR/victus-toolkit") && ./install.sh"
   if [[ $WANT_HPWMI -eq 1 ]]; then
-    echo "echo '-- hp-wmi-victus-8bb1 (DKMS kernel module)'"
-    echo "cd $(printf '%q' "$DEPS_DIR/victus-toolkit") && HP_WMI_KBD_DIR=$(printf '%q' "$DEPS_DIR/hp-wmi-victus-8bb1") ./install-hpwmi.sh"
-    echo "cd $(printf '%q' "$DEPS_DIR/victus-toolkit") && ./setup-kbd-led.sh"
+    # A subshell's own `set -e` is silently suppressed by bash when that
+    # subshell is used directly as an `if`/`!` condition -- a real bash
+    # gotcha that would make failures here invisible. So: run the subshell
+    # as a plain command with the OUTER script's errexit off, capture its
+    # exit code explicitly, then re-enable errexit before branching on it.
+    # This step is optional; the Power House install below is not, and must
+    # still run even if this one fails.
+    echo "set +e"
+    echo "( set -e"
+    echo "  echo '-- hp-wmi-victus-8bb1 (DKMS kernel module)'"
+    echo "  cd $(printf '%q' "$DEPS_DIR/victus-toolkit") && HP_WMI_KBD_DIR=$(printf '%q' "$DEPS_DIR/hp-wmi-victus-8bb1") ./install-hpwmi.sh"
+    echo "  cd $(printf '%q' "$DEPS_DIR/victus-toolkit") && ./setup-kbd-led.sh"
+    echo ")"
+    echo "hpwmi_rc=\$?"
+    echo "set -e"
+    echo "if [[ \$hpwmi_rc -ne 0 ]]; then"
+    echo "  echo 'WARNING: hp-wmi-victus-8bb1 step failed -- continuing without it.' >&2"
+    echo "  echo '         GPU CTGP/PPAB and CPU power-limit WMI control wont work; everything' >&2"
+    echo "  echo '         else will. Re-run install-hpwmi.sh by hand later to retry.' >&2"
+    echo "fi"
   fi
   echo "echo '-- Power House (governor, polkit, systemd, bar plugin)'"
   echo "cd $(printf '%q' "$REPO_DIR") && ./install.sh"
