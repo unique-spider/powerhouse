@@ -509,8 +509,17 @@ Panel {
             Tile { icon: "󰍛"; label: "MEM"; value: String(Number(root.ggpu.clockMem || root.gpu.clockMem || 0)); unit: "MHz" }
             Tile { icon: "󰔏"; label: "GPU"; value: String(Number(root.ggpu.temp || root.gpu.temp || 0)); unit: "°C"; hot: Number(root.ggpu.temp || 0) >= Number(root.limits.gpu_temp_max || 87) }
             Tile { icon: "󱐋"; label: "GPU"; value: String(Math.round(Number(root.ggpu.powerW || root.gpu.power || 0))); unit: "W" }
+            Tile { icon: "󰘚"; label: "VRAM"; value: String(Number(root.gpu.vramUsed || 0)); unit: "MB" }
           }
           Note { text: "Every change here asks for your password (polkit) and is clamped to the governor's caps. The governor re-checks every 3 s and reverts anything above a cap; a hard crash while an offset is active lowers the cap below it automatically. Caps never exceed +300/+1500 MHz and 45/115 W by design." }
+          Section { text: "VRAM BY APP" }
+          Column { width: parent.width; spacing: Style.spacing.labelGap
+            Repeater {
+              model: root.gpu.processes || []
+              Pair { required property var modelData; label: String(modelData.name || "?"); value: Number(modelData.vramMB || 0) + " MB" }
+            }
+          }
+          Note { visible: !(root.gpu.processes && root.gpu.processes.length); text: "No process is using the discrete GPU right now — this laptop's desktop runs on the Intel iGPU; an app only shows up here once it's actually launched on the RTX 4050 (PRIME offload)." }
           Section { text: "GPU CLOCK OFFSET (CAPPED)" }
           Note { text: "Type a value and press Enter (or Apply). No sliders here on purpose — a stray scroll can never change a clock." }
           Column { width: parent.width; spacing: Style.space(8); enabled: root.govOnline; opacity: root.govOnline ? 1 : 0.45
@@ -755,6 +764,8 @@ Panel {
             hot: sysCol.v ? Number(sysCol.v.cpu.total) > 85 : false }
           Meter { label: "Memory"; value: sysCol.v ? Number(sysCol.v.mem.used) : 0; maxValue: sysCol.v ? Math.max(1, Number(sysCol.v.mem.total)) : 1
             text: sysCol.v ? root.fmtMB(Math.round(sysCol.v.mem.used / 1048576)) + " / " + root.fmtMB(Math.round(sysCol.v.mem.total / 1048576)) : "—"; hot: false }
+          Meter { label: "VRAM"; value: Number(root.gpu.vramUsed || 0); maxValue: Math.max(1, Number(root.gpu.vramTotal || 1))
+            text: Number(root.gpu.vramUsed || 0) + " / " + Number(root.gpu.vramTotal || 0) + " MB"; hot: false }
           Row {
             width: parent.width; spacing: Style.space(20)
             Column { width: (parent.width - parent.spacing) / 2; spacing: Style.spacing.labelGap
