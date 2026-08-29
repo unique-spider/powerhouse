@@ -127,9 +127,11 @@ for GPU CTGP/PPAB and CPU power-limit control via WMI. Skip this one if you
 don't need those two features.
 
 **Step 3.** [`victus-toolkit`](https://github.com/unique-spider/victus-toolkit)
-— `victus-priv` and friends: the small, argument-validated privileged helper
-that the governor and sudoers rule (`governor/sudoers.victus-plugin`) call
-into for EC/GPU/keyboard operations.
+— `victus-priv` (the small, argument-validated privileged helper the governor
+and sudoers rule call into for EC/GPU/keyboard operations) **and `victusctl`**,
+the CLI that `bin/powerhouse` actually shells out to for fan/battery/guard/
+clamshell/cam/privacy/auto status and actions. Without this repo installed,
+the plugin loads and shows temperatures fine, but most tab actions will fail.
 
 ## Step 1 — Install
 
