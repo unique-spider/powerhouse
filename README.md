@@ -25,17 +25,18 @@ on this exact laptop — see [Why it exists](#why-it-exists) for the story.
 ## Table of contents
 
 1. [What you get](#what-you-get)
-2. [Screenshots](#screenshots)
-3. [Prerequisites](#prerequisites)
-4. [Step 1 — Install](#step-1--install)
-5. [How the root access actually works](#how-the-root-access-actually-works)
-6. [Step 2 — Set up the AI governor (logging in with your AI model)](#step-2--set-up-the-ai-governor-logging-in-with-your-ai-model)
-7. [Using Power House, tab by tab](#using-power-house-tab-by-tab)
-8. [Uninstall](#uninstall)
-9. [Why it exists](#why-it-exists)
-10. [Architecture, for the curious](#architecture-for-the-curious)
-11. [Files](#files)
-12. [Updating the screenshots](#updating-the-screenshots)
+2. [Benefits](#benefits)
+3. [Screenshots](#screenshots)
+4. [Prerequisites](#prerequisites)
+5. [Step 1 — Install](#step-1--install)
+6. [How the root access actually works](#how-the-root-access-actually-works)
+7. [Step 2 — Set up the AI governor (logging in with your AI model)](#step-2--set-up-the-ai-governor-logging-in-with-your-ai-model)
+8. [Using Power House, tab by tab](#using-power-house-tab-by-tab)
+9. [Uninstall](#uninstall)
+10. [Why it exists](#why-it-exists)
+11. [Architecture, for the curious](#architecture-for-the-curious)
+12. [Files](#files)
+13. [Updating the screenshots](#updating-the-screenshots)
 
 ## What you get
 
@@ -49,6 +50,54 @@ on this exact laptop — see [Why it exists](#why-it-exists) for the story.
   something looks wrong.
 * A full audit trail: every incident, every AI run, every tweak — all on one
   timeline in the Guard tab.
+
+## Benefits
+
+<img src="assets/tab-gov.png" alt="Gov tab showing enforced limits and AI budget" align="right" width="360">
+
+**It fixes a real, documented crash, not a hypothetical one.** This project
+exists because two separate processes were racing to poke the same EC
+registers, corrupting memory and hard-crashing the laptop 4–5 times a day.
+Power House makes the governor the *only* process allowed near the EC — one
+lock, one whitelisted register, a write-rate budget with a trip switch. That
+specific failure mode can't recur.
+
+**Every risky change still asks you, every time.** There's no "trust this
+app once and it does whatever it wants" moment. Overclock offsets and power
+limits go through polkit's password dialog on every single request — nothing
+runs silently in the background with standing root access to change your
+hardware.
+
+**Hard ceilings the AI itself can't cross.** The optional AI reviewer can
+only *tighten* safety limits after something looks wrong — never loosen
+them. And a cap that was live during a real hard crash gets locked
+(`crash_locked`) until you explicitly unlock it, so the exact condition that
+just crashed your machine can't be reapplied by accident five minutes later.
+
+**One dashboard instead of five terminals.** Keyboard backlight, GPU/CPU
+overclock, fans, power limits, battery cap, and service health all live in
+one bar panel — no more `victus-fanctl status`, `nvidia-smi -q`, and
+`systemctl status` in three different tabs just to check if everything's OK.
+
+**Nothing is hidden.** Every thermal-guard trip, every governor incident,
+and every AI run lands on one merged timeline (the Guard tab) — you can see
+exactly what changed, when, and why, going back through the log files on
+disk (`/var/lib/powerhouse/`), not just the last thing the UI happened to
+show you.
+
+**The AI reviewer runs on your own account, and it's optional.** It calls
+your own local Claude Code login — no separate signup, no data sent to a
+service you haven't already chosen to trust — and a single systemd command
+turns it off if you'd rather not have an LLM anywhere near your hardware
+logs: `systemctl --user disable --now powerhouse-ai.timer`.
+
+**You can read every privileged line before you trust it.** The whole stack
+— governor, root helper, polkit policy — is MIT-licensed and small enough
+to actually audit yourself: `governor/powerhouse-governor` and
+`victus-toolkit`'s `victus-priv` are the only two places that touch
+hardware as root, and every privileged command in `victus-priv` is a fixed,
+regex-validated operation with hard-clamped ranges — no free-form input ever
+reaches a shell.
 
 ## Screenshots
 
