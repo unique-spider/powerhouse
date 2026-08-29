@@ -5,7 +5,6 @@ reviewer that watches for trouble.** Built after a run of real hard crashes
 on this exact laptop — see [Why it exists](#why-it-exists) for the story.
 
 ![Power House demo](assets/demo.gif)
-*(drop a short screen recording at `assets/demo.gif` — see [Adding your own screenshots](#adding-your-own-screenshots))*
 
 > **⚠️ Read this before installing.** This is a root-privileged system, not a
 > sandboxed widget:
@@ -36,7 +35,7 @@ on this exact laptop — see [Why it exists](#why-it-exists) for the story.
 9. [Why it exists](#why-it-exists)
 10. [Architecture, for the curious](#architecture-for-the-curious)
 11. [Files](#files)
-12. [Adding your own screenshots](#adding-your-own-screenshots)
+12. [Updating the screenshots](#updating-the-screenshots)
 
 ## What you get
 
@@ -52,10 +51,6 @@ on this exact laptop — see [Why it exists](#why-it-exists) for the story.
   timeline in the Guard tab.
 
 ## Screenshots
-
-Real screenshots go here once added — see
-[Adding your own screenshots](#adding-your-own-screenshots) for exact
-filenames.
 
 | Tab | What it shows |
 |---|---|
@@ -346,14 +341,16 @@ over-cap `desired.json` clamped, AI proposal accepted only when tighter
 (with floors), SIGTERM → marker → `boot.clean`; audio router moves a fake
 app both ways; one real Sonnet 5 review with usage accounting.
 
-## Adding your own screenshots
+## Updating the screenshots
 
-Drop image files into `assets/` with these exact names and they'll show up
-in this README automatically (GitHub renders them from the repo):
+The images under `assets/` are real captures of the panel (taken on an
+isolated empty workspace so no other windows leak into frame — see
+`assets/demo.gif`'s source frames). To refresh them after a UI change,
+overwrite the same filenames and push:
 
 | File | Used for |
 |---|---|
-| `assets/demo.gif` | Top-of-README animated demo — a short recording cycling through a few tabs |
+| `assets/demo.gif` | Top-of-README animated demo — cycles through Keys → OC → Fan → Power → Guard → Gov |
 | `assets/tab-keys.png` | Keys tab |
 | `assets/tab-oc.png` | OC tab |
 | `assets/tab-fan.png` | Fan tab |
@@ -362,6 +359,3 @@ in this README automatically (GitHub renders them from the repo):
 | `assets/tab-batt.png` | Batt tab |
 | `assets/tab-sys.png` | Sys tab |
 | `assets/tab-gov.png` | Gov tab |
-
-A PNG per tab plus one short GIF cycling through 3–4 of them is plenty —
-no need for a recording of every single tab.
