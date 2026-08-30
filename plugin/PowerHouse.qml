@@ -679,7 +679,7 @@ Panel {
                   Text { text: root.fmtTS(modelData.t); color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
                   Text { text: "· " + root.timeAgo(modelData.t); color: root.cMute; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
                   Item { width: Math.max(0, parent.width - parent.children[0].implicitWidth - parent.children[1].implicitWidth - alertTitle.implicitWidth - parent.spacing * 3); height: 1 }
-                  Text { id: alertTitle; text: String(modelData.title || ""); color: modelData.critical ? root.cBad : root.cWarn; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true } }
+                  Text { id: alertTitle; text: String(modelData.title || ""); textFormat: Text.PlainText; color: modelData.critical ? root.cBad : root.cWarn; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true } }
                 Note { text: String(modelData.body || ""); maximumLineCount: 2; elide: Text.ElideRight } }
             }
           }
@@ -705,9 +705,9 @@ Panel {
                   Text { text: new Date(Number(modelData.t) * 1000).toLocaleString(Qt.locale(), "dd MMM HH:mm"); color: root.cMute; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true; width: Style.space(84) }
                   Column { width: parent.width - Style.space(84) - parent.spacing; spacing: Style.space(1)
                     Row { width: parent.width; spacing: Style.space(6)
-                      Text { text: String(modelData.title || ""); color: root.lvlColor(String(modelData.level || "info")); font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; elide: Text.ElideRight; width: parent.width - srcTag.implicitWidth - parent.spacing }
-                      Text { id: srcTag; text: String(modelData.src || "").toUpperCase(); color: root.cMute; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.letterSpacing: 1 } }
-                    Text { visible: String(modelData.detail || "") !== ""; text: String(modelData.detail || ""); color: root.bar.foreground; opacity: 0.6; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; wrapMode: Text.WordWrap; width: parent.width; maximumLineCount: 2; elide: Text.ElideRight }
+                      Text { text: String(modelData.title || ""); textFormat: Text.PlainText; color: root.lvlColor(String(modelData.level || "info")); font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true; elide: Text.ElideRight; width: parent.width - srcTag.implicitWidth - parent.spacing }
+                      Text { id: srcTag; text: String(modelData.src || "").toUpperCase(); textFormat: Text.PlainText; color: root.cMute; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.letterSpacing: 1 } }
+                    Text { visible: String(modelData.detail || "") !== ""; text: String(modelData.detail || ""); textFormat: Text.PlainText; color: root.bar.foreground; opacity: 0.6; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; wrapMode: Text.WordWrap; width: parent.width; maximumLineCount: 2; elide: Text.ElideRight }
                   }
                 }
               }
@@ -863,11 +863,11 @@ Panel {
           }
           Section { text: "LESSONS (AI MEMORY · TAIL)" }
           Rectangle { width: parent.width; radius: Style.space(6); color: root.cFill; implicitHeight: lessonsText.implicitHeight + Style.space(16)
-            Text { id: lessonsText; anchors.fill: parent; anchors.margins: Style.space(8); wrapMode: Text.WordWrap
+            Text { id: lessonsText; anchors.fill: parent; anchors.margins: Style.space(8); wrapMode: Text.WordWrap; textFormat: Text.PlainText
               text: String(root.ai.lessons_tail || "(empty)"); color: root.bar.foreground; opacity: 0.8; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption } }
           Section { visible: root.aiOut !== ""; text: "LAST AI OUTPUT" }
           Rectangle { visible: root.aiOut !== ""; width: parent.width; radius: Style.space(6); color: root.cFill; implicitHeight: aiText.implicitHeight + Style.space(16)
-            Text { id: aiText; anchors.fill: parent; anchors.margins: Style.space(8); wrapMode: Text.WordWrap
+            Text { id: aiText; anchors.fill: parent; anchors.margins: Style.space(8); wrapMode: Text.WordWrap; textFormat: Text.PlainText
               text: root.aiOut.slice(0, 2500); color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption } }
         }
       }
@@ -952,6 +952,13 @@ Panel {
   }
   component Section: PanelSectionHeader { foreground: root.bar.foreground; fontFamily: root.bar.fontFamily }
   component Note: Text {
+    // Plain text always: several call sites render AI output, journal-derived
+    // strings, or other locally-influenced text here, and this app has no
+    // legitimate use for rich-text/HTML rendering anywhere. Without this,
+    // QML's default Text.AutoText would auto-promote markup-looking content
+    // to rich text -- including <img src=...> tags that trigger a real
+    // network fetch from inside the long-lived shell process.
+    textFormat: Text.PlainText
     width: parent.width; wrapMode: Text.WordWrap; color: root.bar.foreground; opacity: 0.55
     font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption
   }
@@ -1066,11 +1073,11 @@ Panel {
         spacing: Style.space(2)
         Row {
           width: parent.width
-          Text { text: parent.parent.parent.parent.title; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
+          Text { text: parent.parent.parent.parent.title; textFormat: Text.PlainText; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.bodySmall; font.bold: true }
           Item { width: Math.max(0, parent.width - parent.children[0].implicitWidth - parent.children[2].implicitWidth); height: 1 }
-          Text { text: parent.parent.parent.parent.metric; color: parent.parent.parent.parent.accent; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
+          Text { text: parent.parent.parent.parent.metric; textFormat: Text.PlainText; color: parent.parent.parent.parent.accent; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption; font.bold: true }
         }
-        Text { text: parent.parent.parent.detail; width: parent.width; wrapMode: Text.WordWrap; color: root.bar.foreground; opacity: 0.7; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
+        Text { text: parent.parent.parent.detail; textFormat: Text.PlainText; width: parent.width; wrapMode: Text.WordWrap; color: root.bar.foreground; opacity: 0.7; font.family: root.bar.fontFamily; font.pixelSize: Style.font.caption }
       }
     }
   }

@@ -18,32 +18,50 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPS_DIR="${POWERHOUSE_DEPS_DIR:-$HOME/.local/share/powerhouse-deps}"
 mkdir -p "$DEPS_DIR"
 
-clone_or_update() {
-  local url=$1 dir=$2
+# Every prerequisite is pinned to an exact, reviewed commit -- including
+# Batuhan4/victus-control, which is a THIRD PARTY's repository, not mine.
+# Without a pin, whatever that maintainer (or any of us) next pushes to the
+# default branch would run as root on every install/re-run with no review at
+# all. Bumping a pin here is a deliberate, visible, reviewable change to this
+# file -- never done implicitly by `git pull`.
+VICTUS_CONTROL_URL="https://github.com/Batuhan4/victus-control.git"
+VICTUS_CONTROL_REF="5ec943dbdbc24f81f6cad26b2c2acadd2388c6f5"   # 2026-07-22
+VICTUS_TOOLKIT_URL="https://github.com/unique-spider/victus-toolkit.git"
+VICTUS_TOOLKIT_REF="5e128dd35d1e4a173b7d6f95a2fe16c37f1e1ca1"   # 2026-08-29
+HPWMI_URL="https://github.com/unique-spider/hp-wmi-victus-8bb1.git"
+HPWMI_REF="89ecbadd6e55033505308ef7bae1fb706b9d3017"            # 2026-08-29
+
+clone_pinned() {
+  local url=$1 ref=$2 dir=$3
   if [[ -d "$dir/.git" ]]; then
-    echo "== updating $(basename "$dir")"
-    git -C "$dir" pull --ff-only --quiet
+    echo "== fetching $(basename "$dir")"
+    git -C "$dir" fetch --quiet origin
   else
     echo "== cloning $(basename "$dir")"
     git clone --quiet "$url" "$dir"
   fi
+  git -C "$dir" checkout --quiet "$ref"
+  local got; got=$(git -C "$dir" rev-parse HEAD)
+  [[ "$got" == "$ref" ]] || { echo "FATAL: $(basename "$dir") did not land on the pinned commit ($ref), got $got -- refusing to run unreviewed code" >&2; exit 1; }
+  echo "   -> $(basename "$dir") @ ${ref:0:12}"
 }
 
 echo "Power House -- one-click install"
-echo "This clones 3 prerequisite repos (all public, linked from the README) into"
+echo "This clones 3 prerequisite repos (all public, linked from the README,"
+echo "each pinned to an exact commit -- see the comment above for why) into"
 echo "  $DEPS_DIR"
 echo "then runs every root-owned install step behind one authentication dialog."
 echo "Nothing here is hidden -- read any of these scripts first if you want to."
 echo
 
-clone_or_update "https://github.com/Batuhan4/victus-control.git"      "$DEPS_DIR/victus-control"
-clone_or_update "https://github.com/unique-spider/victus-toolkit.git" "$DEPS_DIR/victus-toolkit"
+clone_pinned "$VICTUS_CONTROL_URL" "$VICTUS_CONTROL_REF" "$DEPS_DIR/victus-control"
+clone_pinned "$VICTUS_TOOLKIT_URL" "$VICTUS_TOOLKIT_REF" "$DEPS_DIR/victus-toolkit"
 
 WANT_HPWMI=0
 read -rp "Also build hp-wmi-victus-8bb1 (kernel-module patch) for GPU CTGP/PPAB + CPU power-limit WMI control? [y/N] " ans
 if [[ "${ans,,}" == y* ]]; then
   WANT_HPWMI=1
-  clone_or_update "https://github.com/unique-spider/hp-wmi-victus-8bb1.git" "$DEPS_DIR/hp-wmi-victus-8bb1"
+  clone_pinned "$HPWMI_URL" "$HPWMI_REF" "$DEPS_DIR/hp-wmi-victus-8bb1"
 fi
 
 echo

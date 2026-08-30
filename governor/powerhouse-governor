@@ -18,7 +18,7 @@ Runs as root from every boot (systemd). Responsibilities:
 
 Socket: /run/powerhouse/sock — newline-delimited JSON, one request per line.
 """
-import json, os, signal, socket, subprocess, sys, threading, time, glob, pwd, grp, fcntl
+import json, os, signal, socket, struct, subprocess, sys, threading, time, glob, pwd, grp, fcntl
 
 VERSION = "1.0.0"
 PREFIX = os.environ.get("POWERHOUSE_PREFIX", "")        # test/dry-run: relocate all state, no hardware
@@ -452,14 +452,30 @@ def serve(gov):
         if not DRY: os.chown(SOCK, 0, gid)
         os.chmod(SOCK, 0o660)
     except (KeyError, PermissionError): os.chmod(SOCK, 0o666)
+    def peer_uid(conn):
+        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        return struct.unpack("3i", creds)[1]
     def handle(conn):
         f = conn.makefile("rwb", buffering=0)
+        try:
+            uid = peer_uid(conn)
+        except OSError:
+            uid = None
         try:
             for line in f:
                 try: req = json.loads(line.decode())
                 except ValueError: f.write(b'{"ok":false,"err":"bad json"}\n'); continue
                 resp = {"ok": True}
                 op = req.get("op")
+                # ec_reset re-arms the EC write-rate trip switch -- the CLI path to it
+                # (powerhouse gov ec-reset) is polkit-gated for a reason. The socket
+                # itself is only reachable by root and this user's own group, but
+                # honoring it from a plain same-user process would let anything running
+                # as the user silently un-trip the arbiter with no password at all.
+                # Require the actual peer to be root (i.e. only via pkexec powerhouse-apply).
+                if op == "ec_reset" and uid != 0:
+                    f.write((json.dumps({"ok": False, "err": "ec_reset requires root -- use: powerhouse gov ec-reset"}) + "\n").encode())
+                    continue
                 if op == "kbd":
                     if "duty" in req: gov.kbd.set(req["duty"]); resp["duty"] = gov.kbd.duty
                     elif req.get("cmd") == "on": gov.kbd.set(100)
