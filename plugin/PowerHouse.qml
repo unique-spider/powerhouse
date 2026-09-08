@@ -26,6 +26,7 @@ Panel {
   property var privacy: ({})
   property var clam: ({})
   property var guard: ({})
+  property var auto: ({})
   property var gov: ({})
   property var keys: ({})
   property var ai: ({})
@@ -152,7 +153,7 @@ Panel {
       var d = JSON.parse(String(text || "{}"))
       root.fan = d.fan || {}; root.kbd = d.kbd || {}; root.gpu = d.gpu || {}
       root.power = d.power || {}; root.batt = d.battery || {}; root.privacy = d.privacy || {}
-      root.clam = d.clamshell || {}; root.guard = d.guard || {}
+      root.clam = d.clamshell || {}; root.guard = d.guard || {}; root.auto = d.auto || {}
       root.gov = d.governor || {}; root.keys = d.keys || {}; root.ai = d.ai || {}; root.timeline = d.timeline || []
       var h = root.cpuHist.slice(); h.push(Number(root.fan.cpu || 0)); if (h.length > 5) h.shift()
       root.cpuHist = h
@@ -615,6 +616,18 @@ Panel {
             Tile { icon: "󰢮"; label: "GPU"; value: String(Math.round(Number(root.power.gpuW || 0))); unit: "W" }
             Tile { icon: "󰔏"; label: "PKG"; value: String(Number(root.gcpu.temp || root.cpuNow || 0)); unit: "°C"; hot: Number(root.gcpu.temp || 0) >= Number(root.limits.cpu_temp_max || 95) }
           }
+          Section { text: "AUTO PROFILE SWITCHING" }
+          KillSwitch {
+            icon: "󰑓"; title: "Auto mode"; state: root.auto.on === true ? "on" : "off"; onLabel: "ON"; offLabel: "OFF"
+            detail: root.auto.on === true
+              ? ("Right now: " + String(root.auto.current || "?") + " (" + String(root.auto.state || "?") + ")")
+              : "Switches profile by itself: a low-power preset on battery, balanced when idle on AC, a stronger one under load on AC. Picking a profile by hand (below) turns this off."
+            onToggled: function(on) { root.run(["auto", on ? "on" : "off"]) }
+          }
+          Note { visible: root.auto.on === true
+            text: "On battery → " + String((root.auto.rules || {}).battery || "?")
+                + "  ·  On AC, idle → " + String((root.auto.rules || {}).idle || "?")
+                + "  ·  On AC, under load → " + String((root.auto.rules || {}).load || "?") }
           Section { text: "POWER PROFILE (NO PASSWORD · NO OVERCLOCK)" }
           ButtonRow {
             model: [ { id: "power-saver", icon: "󰌪", label: "Saver" }, { id: "balanced", icon: "󰗑", label: "Balanced" }, { id: "performance", icon: "󱐋", label: "Performance" } ]
