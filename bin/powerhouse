@@ -20,6 +20,7 @@ VICTUSCTL = f"{H}/.local/bin/victusctl"; AUDIOCTL = f"{H}/.local/bin/kbd-audioct
 AUDIO_CONF = f"{H}/.config/powerhouse/audio.json"; AUDIOD_STATE = f"{H}/.local/state/powerhouse/audiod.json"
 AI_CONF = f"{H}/.config/powerhouse/ai.json"; AI_LOG = f"{H}/.local/state/powerhouse/ai-runs.jsonl"
 LESSONS = f"{H}/.local/state/powerhouse/lessons.md"
+ACTIONS_LOG = f"{H}/.local/state/powerhouse/actions.jsonl"
 APPLY = "/usr/local/bin/powerhouse-apply"
 def jload(p, d):
     try: return json.load(open(p))
@@ -42,6 +43,17 @@ def gov(op):
 def tail_jsonl(p, n):
     try: return [json.loads(l) for l in open(p).readlines()[-n:] if l.strip()]
     except (OSError, ValueError): return []
+def log_action(action, target="", note="human, via the bar panel", frm=None):
+    """Record a human-initiated change so the Guard tab's timeline shows who changed what and
+    why, not just what the governor/AI did on their own. Best-effort: never blocks the action
+    that triggered it, and failures are silently swallowed (a logging bug should never stop a
+    real hardware change from applying)."""
+    try:
+        os.makedirs(os.path.dirname(ACTIONS_LOG), exist_ok=True)
+        rec = {"t": time.time(), "action": action, "target": target, "note": note}
+        if frm is not None: rec["from"] = frm
+        with open(ACTIONS_LOG, "a") as f: f.write(json.dumps(rec) + "\n")
+    except OSError: pass
 def timeline(n=40):
     """Everything the guards did, newest first: guardian alerts, governor incidents/events, AI runs."""
     ev = []
@@ -65,6 +77,13 @@ def timeline(n=40):
         ev.append({"t": r.get("t", 0), "src": "ai", "kind": r.get("kind", ""),
                    "title": ("AI skipped: " + r["skipped"]) if r.get("skipped") else "AI " + str(r.get("kind", "")) + " (" + str(r.get("model", "")).replace("claude-", "") + ")",
                    "detail": (str(r.get("tokens", 0)) + " tokens") if not r.get("skipped") else "", "level": "info"})
+    for r in tail_jsonl(ACTIONS_LOG, 40):
+        target = str(r.get("target", ""))
+        frm = r.get("from")
+        detail = str(r.get("note", "")) + (f"  (was: {json.dumps(frm)})" if frm else "")
+        ev.append({"t": r.get("t", 0), "src": "human", "kind": r.get("action", ""),
+                   "title": str(r.get("action", "")) + (" → " + target if target else ""),
+                   "detail": detail[:160], "level": "info"})
     ev.sort(key=lambda e: -float(e.get("t") or 0)); return ev[:n]
 def status():
     try: v = json.loads(sh([VICTUSCTL, "status"], 40))
@@ -116,25 +135,44 @@ def main(a):
     if not a or a[0] == "status": print(json.dumps(status())); return
     c = a[0]
     if c == "gov":
-        if a[1:2] == ["ec-reset"]: print(sh(["pkexec", APPLY, "ec-reset"], 120)); return
+        if a[1:2] == ["ec-reset"]:
+            log_action("gov.ec_reset", note="human re-armed the EC write-rate trip switch, via pkexec")
+            print(sh(["pkexec", APPLY, "ec-reset"], 120)); return
         print(json.dumps(gov(a[1] if len(a) > 1 else "status")))
     elif c == "tweak":
-        if a[1:2] == ["unlock-crashed"] and len(a) > 2: print(sh(["pkexec", "/usr/local/bin/powerhouse-unlock", a[2]], 120)); return
+        if a[1:2] == ["unlock-crashed"] and len(a) > 2:
+            log_action("tweak.unlock_crashed", target=a[2], note="human released a crash-locked cap, via pkexec")
+            print(sh(["pkexec", "/usr/local/bin/powerhouse-unlock", a[2]], 120)); return
+        if a[1:2] == ["stock"]:
+            log_action("tweak.stock", note="human reset GPU/CPU to stock clocks, via pkexec")
+        elif a[1:2] == ["restore-defaults"]:
+            log_action("tweak.restore_defaults", note="human restored default limits, via pkexec")
+        elif a[1:2] in (["set"], ["loosen"], ["tighten"]) and len(a) > 3:
+            d = gov("status").get("status", {}).get("desired", {}) or {}
+            pairs = list(zip(a[2::2], a[3::2]))
+            frm = {k: d.get(k) for k, _ in pairs if k in d} or None
+            log_action(f"tweak.{a[1]}", target=" ".join(f"{k}={v}" for k, v in pairs), frm=frm,
+                       note=f"human {a[1]} a limit, via pkexec")
         print(sh(["pkexec", APPLY] + a[1:], 120))
     elif c == "keys":
         sub = a[1] if len(a) > 1 else "status"
         if sub == "audio":
             m = a[2] if len(a) > 2 else "toggle"
+            log_action("keys.audio", target=m)
             print(sh([AUDIOCTL, {"on": "start", "off": "off", "toggle": "toggle"}.get(m, m)] + a[3:]))
         elif sub == "exclude":
             conf = jload(AUDIO_CONF, {"enabled": True, "excluded": []}); ex = [x.lower() for x in conf.get("excluded", [])]
-            if a[2:3] == ["add"] and len(a) > 3: ex = sorted(set(ex + [a[3].lower()]))
-            elif a[2:3] == ["remove"] and len(a) > 3: ex = [x for x in ex if x != a[3].lower()]
-            elif a[2:3] == ["enable"]: conf["enabled"] = True
-            elif a[2:3] == ["disable"]: conf["enabled"] = False
+            if a[2:3] == ["add"] and len(a) > 3:
+                ex = sorted(set(ex + [a[3].lower()])); log_action("keys.exclude_add", target=a[3])
+            elif a[2:3] == ["remove"] and len(a) > 3:
+                ex = [x for x in ex if x != a[3].lower()]; log_action("keys.exclude_remove", target=a[3])
+            elif a[2:3] == ["enable"]: conf["enabled"] = True; log_action("keys.routing", target="enable")
+            elif a[2:3] == ["disable"]: conf["enabled"] = False; log_action("keys.routing", target="disable")
             conf["excluded"] = ex; jsave(AUDIO_CONF, conf); print(json.dumps(conf))
         elif sub == "budget" and len(a) > 3:
             lim = jload("/etc/powerhouse/limits.json", {}); hz, w = int(a[2]), int(a[3]); out = []
+            log_action("keys.budget", target=f"{hz}Hz {w}writes/s",
+                        frm={"kbd_pwm_hz": lim.get("kbd_pwm_hz"), "kbd_writes_per_s_max": lim.get("kbd_writes_per_s_max")})
             for k, v in (("kbd_pwm_hz", hz), ("kbd_writes_per_s_max", w)):
                 op = "tighten" if v <= int(lim.get(k, 10**9)) else "loosen"
                 out.append(sh(["pkexec", APPLY, op, k, str(v)], 120))
@@ -143,10 +181,14 @@ def main(a):
     elif c == "ai":
         os.execv(AI, [AI] + a[1:])
     elif c == "power" and a[1:2] == ["profile"] and len(a) > 2:
+        log_action("power.profile", target=a[2])
         print(sh(["powerprofilesctl", "set", a[2]]))
     elif c == "mic":
-        print(mic(a[1] if len(a) > 1 else "status"))
+        m = a[1] if len(a) > 1 else "status"
+        if m != "status": log_action("mic", target=m)
+        print(mic(m))
     elif c in ("fan", "battery", "guard", "clamshell", "cam", "privacy", "auto", "revert"):
+        log_action(c, target=" ".join(a[1:]))
         os.execv(VICTUSCTL, [VICTUSCTL] + a)
     else: print(__doc__); sys.exit(2)
 if __name__ == "__main__": main(sys.argv[1:])
