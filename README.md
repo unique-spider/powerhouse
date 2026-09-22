@@ -133,6 +133,10 @@ the CLI that `bin/powerhouse` actually shells out to for fan/battery/guard/
 clamshell/cam/privacy/auto status and actions. Without this repo installed,
 the plugin loads and shows temperatures fine, but most tab actions will fail.
 
+You'll also need a C compiler (`gcc` or `clang`) on `$PATH`, or `$CC` pointing
+at one — `install.sh` builds `kbdlight-helper` from source every install
+rather than shipping a prebuilt binary.
+
 ## Step 1 — Install
 
 ### One-click (recommended)
@@ -186,10 +190,27 @@ reads `$SUDO_USER` to know who you are and refuses to run if that's unset.
 This is the part worth understanding before you type your password. Here's
 exactly what happens, step by step:
 
+0. **Before touching anything, the installer snapshots itself.** Your
+   checkout is a directory you (or anything running as you) can still write
+   to, even after `sudo`/`pkexec` has granted root. So the very first thing
+   `install.sh` does as root is take the exact git commit you're running —
+   via `git archive`, which reads bytes straight out of git's
+   content-addressed object store, not the mutable working tree — and
+   extract it into a fresh, root-owned (`0700`) directory under
+   `/run/powerhouse-install`. Every install step after that reads only from
+   that snapshot, never again from your checkout. `install-all.sh` does the
+   same for each of the 3 prerequisite repos before running their installers.
+   This closes a real gap: without it, anything with your same user ID could
+   swap a file in your checkout in the moment between the password prompt
+   and the `install` line that reads it, and root would install whatever got
+   swapped in.
 1. **You run `sudo ./install.sh` once.** That single password entry lets the
    *installer* — not the plugin itself — copy a handful of files into place:
-   a root-owned governor binary, a systemd service, a polkit policy file, and
-   a narrow sudoers rule. This step never runs again unless you reinstall.
+   a root-owned governor binary (plus `kbdlight-helper`, **compiled from
+   `governor/kbdlight-helper.c` at install time** — no prebuilt binary is
+   ever committed to this repo, so there's nothing to trust beyond the
+   35-line source), a systemd service, a polkit policy file, and a narrow
+   sudoers rule. This step never runs again unless you reinstall.
 2. **The governor daemon starts at boot, as root, forever.** But its own
    power is deliberately tiny: it only touches a *single whitelisted EC
    register* (`0x1805`, the keyboard backlight), it has a write-rate budget
@@ -364,7 +385,7 @@ reference, not something to reinstate.
 |---|---|---|
 | `powerhouse-governor` | root, `powerhouse-governor.service` (every boot) | **EC arbiter** (single lock, register whitelist `0x1805`, write-rate budget with trip), keyboard soft-PWM, 3 s enforcement of `/etc/powerhouse/limits.json`, crash memory (`/var/lib/powerhouse/{last-state.json,incidents.jsonl,events.jsonl}`), applies `desired.json` clamped to caps |
 | `powerhouse-apply` | root via **pkexec** (polkit `auth_admin` → password every time) | the only writer of `desired.json`; the only path that can **loosen** caps (hard bounds: core ≤ +300, mem ≤ +1500, PL ≤ 45/115 W) |
-| `kbdlight-helper` (shim) | user, not setuid | same CLI as the old helper, but only forwards duty values to the governor socket |
+| `kbdlight-helper` (shim) | user, not setuid; built from `governor/kbdlight-helper.c` at install time, never shipped as a binary | same CLI as the old helper, but only forwards duty values to the governor socket |
 | `powerhouse-audiod` | user service | per-app routing: excluded apps bypass the `kbd-mix` sink the keys listen to |
 | `powerhouse-ai` | user timer (login + 30 min) | Claude Code `-p`: Sonnet 5 reviews, Opus 5 after a crash; may only **tighten**; rolling 5 h budget (8 runs / 120k tokens / 2 Opus) |
 | `powerhouse` | user CLI | status JSON for the panel; actions |
